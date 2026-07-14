@@ -3,6 +3,78 @@
 Atomical Keyguard is a local-first security daemon foundation for policy-bound
 agent operations. This initial slice uses Node.js ESM and Node built-ins only.
 
+## Quick start: Claude Code or Codex
+
+Use these steps from the Atomical Keyguard checkout. They install a private,
+project-scoped skill by default; choose one client or install both.
+
+### 1. Start Keyguard
+
+Node.js 25+ is required. In one terminal, keep the local daemon running:
+
+```sh
+npm test
+npm start
+```
+
+Open `http://127.0.0.1:4545`. In guided setup, keep **this project** selected,
+leave the detected host checked, choose **Prepare install plan**, review the
+relative destinations, then choose **Install selected skill**. No credentials
+are shown or copied during setup.
+
+### 2. Connect your coding client
+
+The installer writes the native skill files. Restart or open a new client
+session from this repository after setup, then register the local MCP server so
+the skill can use Keyguard's safe tools.
+
+**Claude Code**
+
+```sh
+claude mcp add --transport stdio --scope local atomical-keyguard -- npm --prefix "$PWD" run mcp
+claude mcp list
+claude
+```
+
+In Claude Code, invoke `/atomical-keyguard`, or ask for a deployment or
+credential-bound workflow and let the installed skill activate when relevant.
+
+**Codex**
+
+```sh
+codex mcp add atomical-keyguard -- npm --prefix "$PWD" run mcp
+codex mcp list
+codex
+```
+
+In Codex, type `$atomical-keyguard`, or ask for a Keyguard-mediated deployment
+workflow. Codex discovers the installed project skill at
+`.agents/skills/atomical-keyguard/`.
+
+### 3. Use the safe workflow
+
+1. Ask the agent to inspect Keyguard status or prepare the allowlisted action.
+   For example: “Use Atomical Keyguard to prepare a Cloudflare Pages deploy of
+   `./dist` for project `my-site`.”
+2. When Keyguard requests attention, return to `http://127.0.0.1:4545` to add
+   a credential or approve the exact action. Do not paste credentials into the
+   agent chat, terminal, prompts, or project files.
+3. Keyguard performs the approved action and shows a compact signed receipt in
+   the local UI. Review the receipt or activity there; the agent never receives
+   the credential value.
+
+The installed skill provides the workflow guidance; the local MCP server
+provides the six safe Keyguard tools. Agent requests cannot bypass an approval,
+launch arbitrary shell commands, or directly reveal/delete a credential.
+
+> **Live credential handoffs need configuration.** The default build has no
+> public deposit gateway. Configure a compatible Atomical gateway and trusted
+> webhook verifier before using the credential-deposit step in a real project.
+
+For current client reference, see [Claude Code skills](https://code.claude.com/docs/en/slash-commands),
+[Claude Code MCP](https://code.claude.com/docs/en/mcp), [Codex skills](https://learn.chatgpt.com/docs/build-skills.md),
+and [Codex MCP](https://learn.chatgpt.com/docs/extend/mcp.md).
+
 ## Run the tests
 
 ```sh
