@@ -1,0 +1,8 @@
+node_modules/
+coverage/
+.atomical-keyguard/
+.env
+.env.*
+!.env.example
+.agent-*.md
+.superpowers/

@@ -1,0 +1,14 @@
+{
+  "name": "atomical-keyguard",
+  "version": "0.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=25"
+  },
+  "type": "module",
+  "scripts": {
+    "mcp": "node src/mcp/stdio-server.mjs",
+    "start": "node src/daemon.mjs",
+    "test": "node --test"
+  }
+}
