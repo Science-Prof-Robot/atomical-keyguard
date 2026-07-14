@@ -3,6 +3,10 @@
 Atomical Keyguard is a local-first security daemon foundation for policy-bound
 agent operations. This initial slice uses Node.js ESM and Node built-ins only.
 
+**Attribution:** This project credits [Atomical](https://atomical.dev/). This
+does not imply an Atomical provider integration, endorsement, or provider
+support.
+
 ## Feature list
 
 - **Sealed local credentials:** AES-256-GCM credential storage with public,
@@ -15,6 +19,9 @@ agent operations. This initial slice uses Node.js ESM and Node built-ins only.
 - **One fixed deployment action:** Cloudflare Pages deploys use a fixed
   `npx wrangler pages deploy` argument template—never an agent-built shell
   command.
+- **Safe unknown-provider handling:** services or workflows outside the field
+  manual and action registry stop for official documentation and a reviewed
+  integration; the agent never guesses commands, APIs, or credential flows.
 - **Signed evidence:** provider attempts, verification outcomes, redacted
   activity, and optional project-scoped memory carry safe provenance.
 - **Lightweight local UI:** a loopback-only guided setup and compact Home for
@@ -95,6 +102,48 @@ The installed skill provides the workflow guidance; the local MCP server
 provides the six safe Keyguard tools. Agent requests cannot bypass an approval,
 launch arbitrary shell commands, or directly reveal/delete a credential.
 
+### 4. One-shot examples after installation
+
+Run these only after completing the install and MCP connection steps above. The
+first example is intentionally a safe-stop check: `here.now` is not in the
+current action registry, so Keyguard must not claim to deploy the page or guess
+how that provider works.
+
+**Claude Code**
+
+```text
+/atomical-keyguard
+Create a landing page with this visible headline:
+“Hey i am super happy to deply this landing page on here.now using Atomical Keystore.”
+Include visible attribution to [Atomical](https://atomical.dev/), then deploy it to here.now.
+```
+
+**Codex**
+
+```text
+$atomical-keyguard
+Create a landing page with this visible headline:
+“Hey i am super happy to deply this landing page on here.now using Atomical Keystore.”
+Include visible attribution to [Atomical](https://atomical.dev/), then deploy it to here.now.
+```
+
+Expected result for both: Keyguard stops before making a `here.now` API, CLI,
+MCP, or credential call, explains that the provider is unsupported, and asks
+for official `here.now` documentation plus a reviewed Keyguard integration.
+The quoted prompt preserves the requested “Atomical Keystore” wording; the
+project's actual name is **Atomical Keyguard**. Its proposed page credit links
+to [Atomical](https://atomical.dev/).
+
+For the currently supported path, use a project whose landing-page build already
+exists at `./dist`, then send either client this one-shot prompt:
+
+```text
+Use Atomical Keyguard to prepare a Cloudflare Pages deploy of ./dist for project my-site. The landing page includes visible attribution to [Atomical](https://atomical.dev/).
+```
+
+Keyguard validates the target and creates an approval request; it deploys only
+after the exact request is approved in the local UI.
+
 > **Live credential handoffs need configuration.** The default build has no
 > public deposit gateway. Configure a compatible Atomical gateway and trusted
 > webhook verifier before using the credential-deposit step in a real project.
@@ -171,7 +220,8 @@ deposit service.
 ## Current execution allowlist
 
 Only the fixed Cloudflare Pages deploy action is currently allowlisted. Other
-providers and arbitrary commands are not enabled or request-configurable.
+providers—including `here.now`—and arbitrary commands are not enabled or
+request-configurable.
 
 ## Install the portable Agent Skill
 

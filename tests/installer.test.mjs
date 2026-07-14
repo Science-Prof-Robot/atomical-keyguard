@@ -8,7 +8,27 @@ import test from 'node:test';
 
 import { discoverEnvironment } from '../src/installer/discovery.mjs';
 import { applyInstall, planInstall } from '../src/installer/skill-installer.mjs';
-import { renderGuidanceShim } from '../src/installer/templates.mjs';
+import {
+  renderFieldManual,
+  renderGuidanceShim,
+  renderSkillTemplate,
+} from '../src/installer/templates.mjs';
+
+test('renders an explicit safe stop for undocumented providers in agent artifacts', () => {
+  const manual = renderFieldManual();
+
+  assert.match(manual, /Undocumented services or providers/);
+  assert.match(manual, /field manual and present in Keyguard's current action registry/);
+  assert.match(manual, /Do not guess its API, CLI, MCP setup/);
+  assert.match(manual, /\[Atomical\]\(https:\/\/atomical\.dev\/\)/);
+
+  for (const host of ['claude', 'codex']) {
+    assert.match(renderSkillTemplate(host), /Undocumented services or providers/);
+    assert.match(renderSkillTemplate(host), /requested service, provider, credential flow, or workflow/i);
+    assert.match(renderSkillTemplate(host), /ask for official provider documentation/i);
+    assert.match(renderGuidanceShim(host), /undocumented provider/i);
+  }
+});
 
 test('discovers the project environment without modifying it', async () => {
   await withInstallerEnvironment(async ({ homeDirectory, projectRoot }) => {
