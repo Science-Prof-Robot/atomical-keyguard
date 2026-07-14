@@ -3,6 +3,27 @@
 Atomical Keyguard is a local-first security daemon foundation for policy-bound
 agent operations. This initial slice uses Node.js ESM and Node built-ins only.
 
+## Feature list
+
+- **Sealed local credentials:** AES-256-GCM credential storage with public,
+  secret-free projections for the UI and agents.
+- **One-time credential handoffs:** signed, short-lived deposit receipts that
+  are claimed before vault access so they cannot be replayed after an ambiguous
+  failure.
+- **Exact human approval:** approvals are time-bounded, single-use, and bound
+  to the requested action, Git commit, project target, and dirty-tree choice.
+- **One fixed deployment action:** Cloudflare Pages deploys use a fixed
+  `npx wrangler pages deploy` argument template—never an agent-built shell
+  command.
+- **Signed evidence:** provider attempts, verification outcomes, redacted
+  activity, and optional project-scoped memory carry safe provenance.
+- **Lightweight local UI:** a loopback-only guided setup and compact Home for
+  credentials, approvals, activity, receipts, and memory.
+- **Agent integration:** native project skills for Claude Code and Codex plus a
+  six-tool, secret-free local MCP server.
+- **Safe installer:** previewed, private-by-default project skills with no
+  automatic Git staging or commits.
+
 ## Quick start: Claude Code or Codex
 
 Use these steps from the Atomical Keyguard checkout. They install a private,
@@ -51,17 +72,24 @@ In Codex, type `$atomical-keyguard`, or ask for a Keyguard-mediated deployment
 workflow. Codex discovers the installed project skill at
 `.agents/skills/atomical-keyguard/`.
 
-### 3. Use the safe workflow
+### 3. Use the safe workflow: concrete examples
 
-1. Ask the agent to inspect Keyguard status or prepare the allowlisted action.
-   For example: “Use Atomical Keyguard to prepare a Cloudflare Pages deploy of
-   `./dist` for project `my-site`.”
-2. When Keyguard requests attention, return to `http://127.0.0.1:4545` to add
-   a credential or approve the exact action. Do not paste credentials into the
-   agent chat, terminal, prompts, or project files.
-3. Keyguard performs the approved action and shows a compact signed receipt in
-   the local UI. Review the receipt or activity there; the agent never receives
-   the credential value.
+The prompts below use the installed skill and local MCP server. The supported
+deployment action is Cloudflare Pages only, and `./dist` must already exist in
+a Git project.
+
+| Goal | Claude Code | Codex | Keyguard result |
+| --- | --- | --- | --- |
+| Start a Keyguard task | Type `/atomical-keyguard`, then: “Check Keyguard status and list the safe actions.” | Type `$atomical-keyguard`, then use the same prompt. | The agent reads only safe status/action metadata. |
+| See credential state safely | “Use Keyguard to list configured credentials. Do not reveal any values.” | Use the same prompt. | You see labels and status only—never token values. |
+| Prepare a deploy | “Use Atomical Keyguard to prepare a Cloudflare Pages deploy of `./dist` for project `my-site`.” | Use the same prompt. | Keyguard validates the target and creates an approval request; it does not deploy yet. |
+| Handle a missing credential | “Keyguard needs a credential. Tell me the next safe UI step, without asking for a token in chat.” | Use the same prompt. | The agent directs you to the loopback UI. A real deposit handoff requires the configured gateway below. |
+| Approve the exact deploy | Open `http://127.0.0.1:4545`, inspect the approval, and choose the approval action there. | Use the same local UI step. | Keyguard consumes the single-use approval and executes the fixed allowed action. |
+| Review the outcome | “Summarize the Keyguard receipt and verification result without exposing credentials.” | Use the same prompt. | The agent reports safe receipt metadata; the UI retains the activity and receipt trail. |
+
+Do not ask either agent to paste a token, run `wrangler` directly, create an
+arbitrary shell command, or bypass an approval. Those are deliberately outside
+the Keyguard capability boundary.
 
 The installed skill provides the workflow guidance; the local MCP server
 provides the six safe Keyguard tools. Agent requests cannot bypass an approval,
