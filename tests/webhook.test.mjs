@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { canonicalJson } from '../src/core/canonical.mjs';
+import { createActionRegistry } from '../src/policy/action-registry.mjs';
+import { createCloudflarePagesIntegration } from '../src/providers/cloudflare-pages.mjs';
 import { DepositService } from '../src/services/deposits.mjs';
 import { JsonStore } from '../src/storage/json-store.mjs';
 import { SealedVault } from '../src/storage/sealed-vault.mjs';
@@ -429,6 +431,10 @@ async function createDepositSystem(options = {}) {
   });
   const gatewayCalls = [];
   const verifierCalls = [];
+  const actionRegistry = options.actionRegistry ?? createActionRegistry({
+    approvedProjectRoots: [process.cwd()],
+    integrations: [createCloudflarePagesIntegration()],
+  });
   const atomicalGateway = options.atomicalGateway ?? testDemoGateway(gatewayCalls);
   const trustedPublicKeyVerifier = Object.hasOwn(options, 'trustedPublicKeyVerifier')
     ? options.trustedPublicKeyVerifier
@@ -443,6 +449,7 @@ async function createDepositSystem(options = {}) {
         });
     };
   const service = await DepositService.open({
+    actionRegistry,
     atomicalGateway,
     clock,
     dataDirectory: options.dataDirectory,

@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 
-import { sha256 } from '../core/canonical.mjs';
-import { ACTION_NAME } from '../policy/action-registry.mjs';
+import { canonicalJson, sha256 } from '../core/canonical.mjs';
 import { JsonStore } from '../storage/json-store.mjs';
 import { defaultDataDirectory } from '../storage/sealed-vault.mjs';
 
 const STORE_VERSION = 1;
 const MEMORY_STATUSES = new Set(['candidate', 'saved', 'dismissed']);
+const MAX_ACTION_DATA_LENGTH = 32 * 1024;
 
 /**
  * Stores only deterministic, receipt-derived project memories. A candidate is
@@ -90,7 +90,7 @@ export class MemoryService {
       sourceReceiptId: verifiedReceipt.body.id,
       sourceSignerFingerprint: verifiedReceipt.signerFingerprint,
       status: 'candidate',
-      text: `Verified Cloudflare Pages deployment for ${verifiedReceipt.body.target.project} at ${verifiedReceipt.body.commit.slice(0, 12)}.`,
+      text: `Verified ${verifiedReceipt.body.action} action at ${verifiedReceipt.body.commit.slice(0, 12)}.`,
       updatedAt: now,
     };
     const record = { ...body, signature: this.#identity.signCanonical(body) };
@@ -176,7 +176,11 @@ function verifiedReceiptProvenance(receipt, identity) {
     if (!isPlainObject(receipt)) {
       return undefined;
     }
-    assertExactKeys(receipt, RECEIPT_KEYS);
+    const receiptKeys = RECEIPT_KEYS.filter((key) => (
+      (key !== 'actionVersion' || Object.hasOwn(receipt, 'actionVersion'))
+      && (key !== 'credentialProvider' || Object.hasOwn(receipt, 'credentialProvider'))
+    ));
+    assertExactKeys(receipt, receiptKeys);
     const body = receiptBody(receipt);
     validateReceiptBody(body);
     validateSignature(receipt.signature, identity);
@@ -203,10 +207,12 @@ function verifiedReceiptProvenance(receipt, identity) {
 
 const RECEIPT_KEYS = [
   'action',
+  'actionVersion',
   'agent',
   'approval',
   'commit',
   'credentialLabel',
+  'credentialProvider',
   'dirtyTreeAllowed',
   'id',
   'provider',
@@ -225,9 +231,14 @@ function validateReceiptBody(body) {
   if (!isPlainObject(body)) {
     throw memoryUnavailable();
   }
-  assertExactKeys(body, RECEIPT_KEYS.filter((key) => key !== 'signature'));
+  const keys = RECEIPT_KEYS.filter((key) => key !== 'signature');
+  const expected = keys.filter((key) => (
+    (key !== 'actionVersion' || Object.hasOwn(body, 'actionVersion'))
+    && (key !== 'credentialProvider' || Object.hasOwn(body, 'credentialProvider'))
+  ));
+  assertExactKeys(body, expected);
   if (
-    body.action !== ACTION_NAME
+    !validActionName(body.action)
     || !validId(body.id, 'receipt')
     || !validId(body.approval?.id, 'approval')
     || body.approval.status !== 'consumed'
@@ -237,12 +248,18 @@ function validateReceiptBody(body) {
     || !validRequestSignature(body.request.signature)
     || typeof body.commit !== 'string'
     || !/^[a-f0-9]{40,64}$/u.test(body.commit)
-    || body.credentialLabel !== 'cloudflare-api-token'
+    || !validCredentialLabel(body.credentialLabel)
     || typeof body.dirtyTreeAllowed !== 'boolean'
     || body.secretExposedToModel !== false
     || (body.retryOf !== null && !validId(body.retryOf, 'receipt'))
     || (body.verificationOf !== null && !validId(body.verificationOf, 'receipt'))
   ) {
+    throw memoryUnavailable();
+  }
+  if (Object.hasOwn(body, 'actionVersion') && !validActionVersion(body.actionVersion)) {
+    throw memoryUnavailable();
+  }
+  if (Object.hasOwn(body, 'credentialProvider') && !validCredentialProvider(body.credentialProvider)) {
     throw memoryUnavailable();
   }
   validateAgent(body.agent);
@@ -270,7 +287,7 @@ function validateMemory(record, identity) {
     || typeof body.createdAt !== 'string'
     || typeof body.updatedAt !== 'string'
     || typeof body.text !== 'string'
-    || !/^Verified Cloudflare Pages deployment for [a-z0-9-]+ at [a-f0-9]{12}\.$/u.test(body.text)
+    || !validMemoryText(body.text)
   ) {
     throw memoryUnavailable();
   }
@@ -355,18 +372,7 @@ function validateRepository(repository) {
 }
 
 function validateTarget(target) {
-  if (!isPlainObject(target)) {
-    throw memoryUnavailable();
-  }
-  assertExactKeys(target, ['directory', 'project']);
-  if (
-    typeof target.directory !== 'string'
-    || !target.directory.startsWith('/')
-    || typeof target.project !== 'string'
-    || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(target.project)
-  ) {
-    throw memoryUnavailable();
-  }
+  validateActionData(target);
 }
 
 function validateTimestampPair(timestamps) {
@@ -386,6 +392,48 @@ function validateStatusRecord(value, allowedStatuses) {
   if (!allowedStatuses.includes(value.status)) {
     throw memoryUnavailable();
   }
+}
+
+function validateActionData(value) {
+  if (!isPlainObject(value)) {
+    throw memoryUnavailable();
+  }
+  try {
+    if (canonicalJson(value).length > MAX_ACTION_DATA_LENGTH) {
+      throw new Error('Action data is too large.');
+    }
+  } catch {
+    throw memoryUnavailable();
+  }
+}
+
+function validActionName(value) {
+  return typeof value === 'string' && /^[a-z][a-z0-9_]{2,127}$/u.test(value);
+}
+
+function validActionVersion(value) {
+  return Number.isInteger(value) && value >= 1 && value <= 1_000_000;
+}
+
+function validCredentialLabel(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 128
+    && value === value.trim()
+    && !/[\u0000-\u001f]/u.test(value);
+}
+
+function validCredentialProvider(value) {
+  return typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/u.test(value);
+}
+
+function validMemoryText(value) {
+  return typeof value === 'string' && (
+    /^Verified [a-z][a-z0-9_]{2,127} action at [a-f0-9]{12}\.$/u.test(value)
+    // Legacy signed memories remain readable after the switch to generic
+    // action wording; new records always use the first pattern.
+    || /^Verified [A-Za-z0-9 _-]{1,128} deployment for [a-z0-9-]+ at [a-f0-9]{12}\.$/u.test(value)
+  );
 }
 
 function validRequestSignature(value) {

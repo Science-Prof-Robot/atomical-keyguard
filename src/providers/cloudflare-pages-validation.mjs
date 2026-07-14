@@ -1,20 +1,15 @@
 import { lstat, realpath, stat } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 
-import { ACTION_NAME } from './action-registry.mjs';
-
 const SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const WINDOWS_ABSOLUTE_PATH = /^(?:[A-Za-z]:[\\/]|[\\/]{1,2})/u;
 
 /**
- * Validates the only action's typed parameters. A directory is returned in
- * both normalized relative form and as the checked real path for execution.
+ * Validates the typed inputs for the optional Cloudflare Pages adapter. A
+ * directory is returned both as a normalized relative value and as the
+ * checked real path used only by that adapter's fixed runner.
  */
-export async function validateActionParams(actionName, params, projectRoot) {
-  if (actionName !== ACTION_NAME) {
-    throw new Error('Action is not allowed.');
-  }
-
+export async function validateCloudflarePagesParams(params, projectRoot) {
   const root = await canonicalRoot(projectRoot);
   const values = readParams(params);
   const directory = await validateDirectory(values.directory, root);

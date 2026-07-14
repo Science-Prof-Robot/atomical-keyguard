@@ -1,7 +1,9 @@
 # Atomical Keyguard
 
-Atomical Keyguard is a local-first security daemon foundation for policy-bound
-agent operations. This initial slice uses Node.js ESM and Node built-ins only.
+Atomical Keyguard is a local-first, vendor-neutral credential vault and policy
+gateway for agent actions. It gives an agent narrowly approved capabilities
+without giving it a reusable secret. This initial slice uses Node.js ESM and
+Node built-ins only.
 
 **Attribution:** This project credits [Atomical](https://atomical.dev/). This
 does not imply an Atomical provider integration, endorsement, or provider
@@ -16,12 +18,14 @@ support.
   failure.
 - **Exact human approval:** approvals are time-bounded, single-use, and bound
   to the requested action, Git commit, project target, and dirty-tree choice.
-- **One fixed deployment action:** Cloudflare Pages deploys use a fixed
-  `npx wrangler pages deploy` argument template—never an agent-built shell
-  command.
-- **Safe unknown-provider handling:** services or workflows outside the field
-  manual and action registry stop for official documentation and a reviewed
-  integration; the agent never guesses commands, APIs, or credential flows.
+- **Optional reviewed integrations:** a new Keyguard profile has **zero
+  provider actions**. An operator can deliberately install a reviewed adapter
+  with a fixed implementation; agents cannot add one from a prompt, repository,
+  field manual, or UI form.
+- **Safe unknown-provider handling:** if a service is absent from the current
+  action registry, it is **not installed in this Keyguard profile**. Keyguard
+  never substitutes another provider, guesses commands/APIs/credential flows,
+  requests a token, or performs an external action.
 - **Signed evidence:** provider attempts, verification outcomes, redacted
   activity, and optional project-scoped memory carry safe provenance.
 - **Lightweight local UI:** a loopback-only guided setup and compact Home for
@@ -34,7 +38,8 @@ support.
 ## Quick start: Claude Code or Codex
 
 Use these steps from the Atomical Keyguard checkout. They install a private,
-project-scoped skill by default; choose one client or install both.
+project-scoped skill by default; choose one client or install both. A fresh
+profile starts with an empty capability list, which is intentional.
 
 ### 1. Start Keyguard
 
@@ -64,8 +69,8 @@ claude mcp list
 claude
 ```
 
-In Claude Code, invoke `/atomical-keyguard`, or ask for a deployment or
-credential-bound workflow and let the installed skill activate when relevant.
+In Claude Code, invoke `/atomical-keyguard`, then ask Keyguard to show its
+installed capabilities before requesting any external action.
 
 **Codex**
 
@@ -75,28 +80,30 @@ codex mcp list
 codex
 ```
 
-In Codex, type `$atomical-keyguard`, or ask for a Keyguard-mediated deployment
-workflow. Codex discovers the installed project skill at
+In Codex, type `$atomical-keyguard`, then ask Keyguard to show its installed
+capabilities before requesting any external action. Codex discovers the
+installed project skill at
 `.agents/skills/atomical-keyguard/`.
 
 ### 3. Use the safe workflow: concrete examples
 
-The prompts below use the installed skill and local MCP server. The supported
-deployment action is Cloudflare Pages only, and `./dist` must already exist in
-a Git project.
+The prompts below use the installed skill and local MCP server. Use the action
+names Keyguard actually lists; do not infer a provider capability from a token,
+repository, or user prompt.
 
 | Goal | Claude Code | Codex | Keyguard result |
 | --- | --- | --- | --- |
 | Start a Keyguard task | Type `/atomical-keyguard`, then: “Check Keyguard status and list the safe actions.” | Type `$atomical-keyguard`, then use the same prompt. | The agent reads only safe status/action metadata. |
 | See credential state safely | “Use Keyguard to list configured credentials. Do not reveal any values.” | Use the same prompt. | You see labels and status only—never token values. |
-| Prepare a deploy | “Use Atomical Keyguard to prepare a Cloudflare Pages deploy of `./dist` for project `my-site`.” | Use the same prompt. | Keyguard validates the target and creates an approval request; it does not deploy yet. |
+| Do local work | “Create and test a local landing page. Do not deploy it.” | Use the same prompt. | This is ordinary local coding, not a Keyguard provider action. |
+| Request an installed action | “List installed Keyguard actions. If one matches this deployment, prepare that named action for the stated target.” | Use the same prompt. | Keyguard validates only a configured action and creates an approval request; it does not deploy yet. |
 | Handle a missing credential | “Keyguard needs a credential. Tell me the next safe UI step, without asking for a token in chat.” | Use the same prompt. | The agent directs you to the loopback UI. A real deposit handoff requires the configured gateway below. |
-| Approve the exact deploy | Open `http://127.0.0.1:4545`, inspect the approval, and choose the approval action there. | Use the same local UI step. | Keyguard consumes the single-use approval and executes the fixed allowed action. |
+| Approve the exact action | Open `http://127.0.0.1:4545`, inspect the approval, and choose the approval action there. | Use the same local UI step. | Keyguard consumes the single-use approval and executes the configured allowed action. |
 | Review the outcome | “Summarize the Keyguard receipt and verification result without exposing credentials.” | Use the same prompt. | The agent reports safe receipt metadata; the UI retains the activity and receipt trail. |
 
-Do not ask either agent to paste a token, run `wrangler` directly, create an
-arbitrary shell command, or bypass an approval. Those are deliberately outside
-the Keyguard capability boundary.
+Do not ask either agent to paste a token, construct a provider CLI/API request,
+create an arbitrary shell command, or bypass an approval. Those are deliberately
+outside the Keyguard capability boundary.
 
 The installed skill provides the workflow guidance; the local MCP server
 provides the six safe Keyguard tools. Agent requests cannot bypass an approval,
@@ -104,10 +111,11 @@ launch arbitrary shell commands, or directly reveal/delete a credential.
 
 ### 4. One-shot examples after installation
 
-Run these only after completing the install and MCP connection steps above. The
-first example is intentionally a safe-stop check: `here.now` is not in the
-current action registry, so Keyguard must not claim to deploy the page or guess
-how that provider works.
+Run these only after completing the install and MCP connection steps above.
+Keep local site creation and external deployment as two separate requests. That
+makes it obvious what did—and did not—cross the Keyguard boundary.
+
+#### A. Build the landing page locally
 
 **Claude Code**
 
@@ -115,7 +123,8 @@ how that provider works.
 /atomical-keyguard
 Create a landing page with this visible headline:
 “Hey i am super happy to deply this landing page on here.now using Atomical Keystore.”
-Include visible attribution to [Atomical](https://atomical.dev/), then deploy it to here.now.
+Include visible attribution to [Atomical](https://atomical.dev/). Keep the page
+local: do not deploy it or request a credential.
 ```
 
 **Codex**
@@ -124,25 +133,33 @@ Include visible attribution to [Atomical](https://atomical.dev/), then deploy it
 $atomical-keyguard
 Create a landing page with this visible headline:
 “Hey i am super happy to deply this landing page on here.now using Atomical Keystore.”
-Include visible attribution to [Atomical](https://atomical.dev/), then deploy it to here.now.
+Include visible attribution to [Atomical](https://atomical.dev/). Keep the page
+local: do not deploy it or request a credential.
 ```
 
-Expected result for both: Keyguard stops before making a `here.now` API, CLI,
-MCP, or credential call, explains that the provider is unsupported, and asks
-for official `here.now` documentation plus a reviewed Keyguard integration.
-The quoted prompt preserves the requested “Atomical Keystore” wording; the
-project's actual name is **Atomical Keyguard**. Its proposed page credit links
-to [Atomical](https://atomical.dev/).
+Expected result for both: the agent creates only local files and tests. No
+provider API, CLI, MCP deployment, credential request, or external action has
+occurred. The quoted prompt preserves the requested “Atomical Keystore”
+wording; the project's actual name is **Atomical Keyguard**. Its proposed page
+credit links to [Atomical](https://atomical.dev/).
 
-For the currently supported path, use a project whose landing-page build already
-exists at `./dist`, then send either client this one-shot prompt:
+#### B. Ask Keyguard about a provider action
+
+Send either client this separate prompt:
 
 ```text
-Use Atomical Keyguard to prepare a Cloudflare Pages deploy of ./dist for project my-site. The landing page includes visible attribution to [Atomical](https://atomical.dev/).
+Use Atomical Keyguard to list installed capabilities. If there is an action for
+deploying this page to here.now, prepare that exact action. Otherwise stop and
+say “here.now is not installed in this Keyguard profile.” Do not substitute a
+different provider, request a credential, invoke an API or CLI, or perform any
+external action. Offer to show installed capabilities or review official
+here.now documentation for a reviewed adapter.
 ```
 
-Keyguard validates the target and creates an approval request; it deploys only
-after the exact request is approved in the local UI.
+On a default profile, the expected result is the stated safe stop. If a
+maintainer has deliberately installed a reviewed adapter for a provider,
+Keyguard may prepare only that action; it still waits for the exact local UI
+approval before execution.
 
 > **Live credential handoffs need configuration.** The default build has no
 > public deposit gateway. Configure a compatible Atomical gateway and trusted
@@ -175,10 +192,11 @@ an identity boundary between local users or untrusted local processes.
 
 ## Foundation contract
 
-`createKeyguardApp(options)` is asynchronous and accepts injectable `clock`,
-`dataDirectory`, `providerRunner`, and `environmentDiscovery` dependencies.
-Its public `status()` response contains the safe loopback endpoint, safe
-identity fingerprint, and persistent setup state.
+`createKeyguardApp(options)` is asynchronous and accepts injectable runtime
+dependencies plus an explicit set of reviewed integrations. Without an
+integration, its action registry is empty. Its public `status()` response
+contains the safe loopback endpoint, safe identity fingerprint, persistent
+setup state, and secret-free capability metadata.
 
 `canonicalJson(value)` produces a stable, key-sorted JSON representation for
 plain JSON records. `sha256(value)` hashes that canonical representation with
@@ -219,9 +237,42 @@ deposit service.
 
 ## Current execution allowlist
 
-Only the fixed Cloudflare Pages deploy action is currently allowlisted. Other
-providers—including `here.now`—and arbitrary commands are not enabled or
-request-configurable.
+The default profile has **no provider action installed**. A reviewed integration
+may add a narrow, immutable action at application startup; it cannot be created
+or changed by an agent, field manual, repository file, request parameter, or UI
+form. A Cloudflare Pages adapter can be used as an optional reference
+integration, not as a product default.
+
+If a provider is absent, say it is **not installed in this Keyguard profile**.
+Do not substitute another provider, request a credential, guess an API or CLI,
+or perform an external action. You may show the installed capabilities or review
+official provider documentation for a future reviewed adapter.
+
+### Enable a reviewed integration (maintainers)
+
+`npm start` and `npm run mcp` intentionally launch an empty profile. To enable
+an adapter, an operator reviews and wires its factory into application startup;
+this is code, not an agent-facing configuration format. For example, the
+optional reference adapter can be embedded like this:
+
+```js
+import { createKeyguardApp } from './src/bootstrap.mjs';
+import { createCloudflarePagesIntegration } from './src/providers/cloudflare-pages.mjs';
+
+const app = await createKeyguardApp({
+  approvedProjectRoots: [process.cwd()],
+  integrations: [createCloudflarePagesIntegration()],
+});
+
+await app.start();                 // local control UI
+const mcp = app.createMcpServer(); // use this same configured app for Claude/Codex
+mcp.start();
+```
+
+Replace that reference factory only with a separately reviewed adapter. Never
+load an adapter definition, command template, credential binding, or provider
+endpoint from a prompt, repository file, field manual, UI form, or runtime
+environment variable.
 
 ## Install the portable Agent Skill
 

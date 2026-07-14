@@ -7,11 +7,14 @@ export const MAX_JSON_RPC_LINE_BYTES = 64 * 1024;
 export const MAX_JSON_RPC_RESPONSE_BYTES = 64 * 1024;
 export const MAX_MCP_LIST_ITEMS = 64;
 
-const ACTION_NAME = 'cloudflare_pages_deploy';
-const CREDENTIAL_LABEL = 'cloudflare-api-token';
+const ACTION_NAME_PATTERN = /^[a-z][a-z0-9_]{2,127}$/u;
 const MAX_JSON_RPC_ID_BYTES = 128;
 const MAX_JSON_RPC_RESULT_BYTES = 16 * 1024;
-const PROVIDER = 'cloudflare';
+const MAX_ACTION_PARAM_BYTES = 8 * 1024;
+const MAX_ACTION_PARAM_DEPTH = 8;
+const MAX_ACTION_PARAM_KEYS = 64;
+const MAX_ACTION_PARAM_STRING_BYTES = 1024;
+const PROVIDER_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const TOOL_NAMES = Object.freeze([
   'keyguard_status',
   'list_credentials',
@@ -39,7 +42,7 @@ export const MCP_TOOLS = freezeDeep([
     name: 'list_credentials',
   },
   {
-    description: 'List the fixed, allowlisted actions available in Keyguard.',
+    description: 'List the installed Keyguard action capabilities.',
     inputSchema: EMPTY_INPUT_SCHEMA,
     name: 'list_actions',
   },
@@ -48,8 +51,8 @@ export const MCP_TOOLS = freezeDeep([
     inputSchema: {
       additionalProperties: false,
       properties: {
-        label: { const: CREDENTIAL_LABEL, type: 'string' },
-        provider: { const: PROVIDER, type: 'string' },
+        label: { maxLength: 128, minLength: 1, type: 'string' },
+        provider: { maxLength: 64, minLength: 1, pattern: '^[a-z0-9][a-z0-9-]{0,63}$', type: 'string' },
       },
       required: ['label', 'provider'],
       type: 'object',
@@ -57,19 +60,15 @@ export const MCP_TOOLS = freezeDeep([
     name: 'create_deposit_link',
   },
   {
-    description: 'Request policy evaluation for a fixed action; never launches a provider.',
+    description: 'Request policy evaluation for an installed action; never launches a provider.',
     inputSchema: {
       additionalProperties: false,
       properties: {
-        action: { const: ACTION_NAME, type: 'string' },
+        action: { maxLength: 128, minLength: 3, pattern: '^[a-z][a-z0-9_]{2,127}$', type: 'string' },
         agentId: { maxLength: 128, minLength: 1, type: 'string' },
         params: {
-          additionalProperties: false,
-          properties: {
-            directory: { maxLength: 256, minLength: 1, type: 'string' },
-            project: { maxLength: 63, minLength: 1, type: 'string' },
-          },
-          required: ['directory', 'project'],
+          additionalProperties: true,
+          maxProperties: MAX_ACTION_PARAM_KEYS,
           type: 'object',
         },
         projectRoot: { maxLength: 4 * 1024, minLength: 1, type: 'string' },
@@ -84,7 +83,7 @@ export const MCP_TOOLS = freezeDeep([
     inputSchema: {
       additionalProperties: false,
       properties: {
-        label: { const: CREDENTIAL_LABEL, type: 'string' },
+        label: { maxLength: 128, minLength: 1, type: 'string' },
       },
       required: ['label'],
       type: 'object',
@@ -489,24 +488,36 @@ async function callTool(app, name, argumentsValue) {
     }
     case 'list_actions': {
       assertExactKeys(argumentsValue, [], -32602);
-      const actions = await invoke(app.services.actionRegistry, 'list');
+      const registry = requiredActionRegistry(app.services.actionRegistry, ['get', 'list']);
+      const actions = await invoke(registry, 'list');
       if (!Array.isArray(actions) || actions.length > MAX_MCP_LIST_ITEMS) {
         throw new Error('action registry unavailable');
       }
-      return { actions: actions.map(projectAction) };
+      return { actions: actions.map((action) => projectAction(action, registry)) };
     }
     case 'create_deposit_link': {
       const metadata = validateDepositArguments(argumentsValue);
+      const registry = requiredActionRegistry(app.services.actionRegistry, ['getCredentialBinding']);
+      const binding = installedCredentialBinding(registry, metadata);
+      if (binding === undefined) {
+        return notInstalledCredential(metadata);
+      }
       return {
-        label: metadata.label,
+        label: binding.label,
+        provider: binding.provider,
         status: 'ui_required',
-        ui: { path: '/?intent=create_deposit_link&label=cloudflare-api-token' },
+        ui: { path: depositIntentPath(binding) },
       };
     }
     case 'execute_action': {
       const request = validateExecuteArguments(argumentsValue);
+      const registry = requiredActionRegistry(app.services.actionRegistry, ['get']);
+      const action = installedAction(registry, request.action);
+      if (action === undefined) {
+        return notInstalledAction(request.action);
+      }
       const decision = await invoke(app.services.policyEngine, 'evaluate', request);
-      return projectPolicyDecision(decision, request, app.services.actionRegistry);
+      return projectPolicyDecision(decision, request, action);
     }
     case 'delete_credential': {
       const label = validateDeleteArguments(argumentsValue);
@@ -525,7 +536,7 @@ function validateDepositArguments(value) {
   assertExactKeys(value, ['label', 'provider'], -32602);
   const label = dataValue(value, 'label', -32602);
   const provider = dataValue(value, 'provider', -32602);
-  if (label !== CREDENTIAL_LABEL || provider !== PROVIDER) {
+  if (!validLabel(label) || typeof provider !== 'string' || !PROVIDER_PATTERN.test(provider)) {
     throw new RpcFailure(-32602);
   }
   return Object.freeze({ label, provider });
@@ -538,7 +549,8 @@ function validateExecuteArguments(value) {
   const params = dataValue(value, 'params', -32602);
   const projectRoot = dataValue(value, 'projectRoot', -32602);
   if (
-    action !== ACTION_NAME
+    typeof action !== 'string'
+    || !ACTION_NAME_PATTERN.test(action)
     || typeof agentId !== 'string'
     || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(agentId)
     || typeof projectRoot !== 'string'
@@ -549,26 +561,10 @@ function validateExecuteArguments(value) {
   ) {
     throw new RpcFailure(-32602);
   }
-  assertExactKeys(params, ['directory', 'project'], -32602);
-  const directory = dataValue(params, 'directory', -32602);
-  const project = dataValue(params, 'project', -32602);
-  if (
-    typeof directory !== 'string'
-    || directory.length === 0
-    || directory.length > 256
-    || directory.includes('\\')
-    || directory.includes('\u0000')
-    || directory.startsWith('/')
-    || directory.split('/').some((part) => part === '' || part === '.' || part === '..')
-    || typeof project !== 'string'
-    || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(project)
-  ) {
-    throw new RpcFailure(-32602);
-  }
   return Object.freeze({
     action,
     agentId,
-    params: Object.freeze({ directory, project }),
+    params: cloneBoundedJsonObject(params, new RpcFailure(-32602)),
     projectRoot,
   });
 }
@@ -576,7 +572,7 @@ function validateExecuteArguments(value) {
 function validateDeleteArguments(value) {
   assertExactKeys(value, ['label'], -32602);
   const label = dataValue(value, 'label', -32602);
-  if (label !== CREDENTIAL_LABEL) {
+  if (!validLabel(label)) {
     throw new RpcFailure(-32602);
   }
   return label;
@@ -626,33 +622,43 @@ function projectCredential(value) {
   return { createdAt, instanceId, label, status, updatedAt };
 }
 
-function projectAction(value) {
+function projectAction(value, registry) {
   assertPlainObject(value);
   const approval = dataValue(value, 'approval');
   const name = dataValue(value, 'name');
   const params = dataValue(value, 'params');
-  assertPlainObject(params);
-  const directory = dataValue(params, 'directory');
-  const project = dataValue(params, 'project');
+  const version = dataValue(value, 'version');
   if (
     approval !== 'always'
-    || name !== ACTION_NAME
-    || directory !== 'relative_path'
-    || project !== 'slug'
+    || typeof name !== 'string'
+    || !ACTION_NAME_PATTERN.test(name)
+    || !Number.isInteger(version)
+    || version < 1
+    || version > 1_000_000
   ) {
     throw new Error('invalid action projection');
   }
-  return { approval, name, params: { directory, project } };
+  const action = installedAction(registry, name);
+  if (
+    action === undefined
+    || action.approval !== approval
+    || action.version !== version
+  ) {
+    throw new Error('invalid action projection');
+  }
+  return {
+    approval,
+    credential: action.credential,
+    name,
+    params: cloneBoundedJsonObject(params, new Error('invalid action projection')),
+    version,
+  };
 }
 
-function projectPolicyDecision(value, request, registry) {
+function projectPolicyDecision(value, request, action) {
   assertPlainObject(value);
   const status = dataValue(value, 'status');
-  const action = fixedAction(registry, request.action);
-  const credentialLabel = dataValue(action, 'credentialLabel');
-  if (credentialLabel !== CREDENTIAL_LABEL) {
-    throw new Error('invalid action mapping');
-  }
+  const credentialLabel = action.credential.label;
   if (status === 'credential_needed') {
     return { action: request.action, credentialLabel, status };
   }
@@ -688,20 +694,100 @@ function projectPolicyDecision(value, request, registry) {
     };
   }
   if (status === 'denied') {
+    const code = optionalDataValue(value, 'code');
+    if (code === 'unknown_action') {
+      return notInstalledAction(request.action);
+    }
     return { action: request.action, status: 'denied' };
   }
   throw new Error('invalid policy decision');
 }
 
-function fixedAction(registry, actionName) {
-  if (registry === null || typeof registry !== 'object' || typeof registry.get !== 'function') {
+function requiredActionRegistry(registry, methods) {
+  if (registry === null || typeof registry !== 'object') {
     throw new Error('action registry unavailable');
   }
+  for (const method of methods) {
+    if (typeof registry[method] !== 'function') {
+      throw new Error('action registry unavailable');
+    }
+  }
+  return registry;
+}
+
+function installedAction(registry, actionName) {
   const action = registry.get(actionName);
-  if (!isPlainObject(action) || dataValue(action, 'name') !== ACTION_NAME) {
+  if (action === undefined) {
+    return undefined;
+  }
+  if (!isPlainObject(action)) {
     throw new Error('action registry unavailable');
   }
-  return action;
+  const approval = dataValue(action, 'approval');
+  const credential = projectCredentialBinding(dataValue(action, 'credential'));
+  const credentialLabel = dataValue(action, 'credentialLabel');
+  const name = dataValue(action, 'name');
+  const version = dataValue(action, 'version');
+  if (
+    approval !== 'always'
+    || name !== actionName
+    || !ACTION_NAME_PATTERN.test(name)
+    || credentialLabel !== credential.label
+    || !Number.isInteger(version)
+    || version < 1
+    || version > 1_000_000
+  ) {
+    throw new Error('action registry unavailable');
+  }
+  return Object.freeze({ approval, credential, name, version });
+}
+
+function installedCredentialBinding(registry, metadata) {
+  const binding = registry.getCredentialBinding(metadata);
+  if (binding === undefined) {
+    return undefined;
+  }
+  const projected = projectCredentialBinding(binding);
+  if (projected.label !== metadata.label || projected.provider !== metadata.provider) {
+    throw new Error('action registry unavailable');
+  }
+  return projected;
+}
+
+function projectCredentialBinding(value) {
+  assertPlainObject(value);
+  const label = dataValue(value, 'label');
+  const provider = dataValue(value, 'provider');
+  if (!validLabel(label) || typeof provider !== 'string' || !PROVIDER_PATTERN.test(provider)) {
+    throw new Error('invalid credential binding');
+  }
+  return Object.freeze({ label, provider });
+}
+
+function notInstalledAction(action) {
+  return {
+    action,
+    message: 'This action is not installed in this Keyguard profile.',
+    status: 'not_installed',
+  };
+}
+
+function notInstalledCredential(metadata) {
+  return {
+    label: metadata.label,
+    message: 'This credential binding is not installed in this Keyguard profile.',
+    provider: metadata.provider,
+    status: 'not_installed',
+  };
+}
+
+function depositIntentPath({ label, provider }) {
+  const query = new URLSearchParams({
+    intent: 'create_deposit_link',
+    label,
+    provider,
+  });
+  return `/?${query.toString()}`;
 }
 
 async function invoke(service, method, ...args) {
@@ -796,6 +882,86 @@ function dataValue(value, key, code = -32603) {
     throw new RpcFailure(code);
   }
   return descriptor.value;
+}
+
+function optionalDataValue(value, key) {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor !== undefined && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+}
+
+function cloneBoundedJsonObject(value, failure) {
+  if (!isPlainObject(value)) {
+    throw failure;
+  }
+  const state = { keys: 0 };
+  const cloned = cloneBoundedJson(value, state, 0, failure);
+  const serialized = JSON.stringify(cloned);
+  if (
+    typeof serialized !== 'string'
+    || Buffer.byteLength(serialized, 'utf8') > MAX_ACTION_PARAM_BYTES
+  ) {
+    throw failure;
+  }
+  return freezeDeep(cloned);
+}
+
+function cloneBoundedJson(value, state, depth, failure) {
+  if (depth > MAX_ACTION_PARAM_DEPTH) {
+    throw failure;
+  }
+  if (value === null || typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw failure;
+    }
+    return value;
+  }
+  if (typeof value === 'string') {
+    if (Buffer.byteLength(value, 'utf8') > MAX_ACTION_PARAM_STRING_BYTES) {
+      throw failure;
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > MAX_ACTION_PARAM_KEYS || Object.getOwnPropertySymbols(value).length > 0) {
+      throw failure;
+    }
+    const result = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) {
+        throw failure;
+      }
+      result.push(cloneBoundedJson(value[index], state, depth + 1, failure));
+    }
+    return result;
+  }
+  if (!isPlainObject(value) || Object.getOwnPropertySymbols(value).length > 0) {
+    throw failure;
+  }
+  const keys = Object.keys(value);
+  if (keys.length > MAX_ACTION_PARAM_KEYS || state.keys + keys.length > MAX_ACTION_PARAM_KEYS) {
+    throw failure;
+  }
+  state.keys += keys.length;
+  const result = {};
+  for (const key of keys) {
+    if (key.length === 0 || key.length > 128 || /[\u0000-\u001f]/u.test(key)) {
+      throw failure;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) {
+      throw failure;
+    }
+    Object.defineProperty(result, key, {
+      configurable: false,
+      enumerable: true,
+      value: cloneBoundedJson(descriptor.value, state, depth + 1, failure),
+      writable: false,
+    });
+  }
+  return result;
 }
 
 function validRequestId(value) {

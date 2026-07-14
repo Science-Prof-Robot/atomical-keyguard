@@ -2,8 +2,7 @@ import { randomBytes } from 'node:crypto';
 
 import { sha256 } from '../core/canonical.mjs';
 import { GitInspector } from '../project/git-inspector.mjs';
-import { ACTION_NAME, createActionRegistry, POLICY_VERSION } from './action-registry.mjs';
-import { validateActionParams } from './validators.mjs';
+import { createActionRegistry, POLICY_VERSION } from './action-registry.mjs';
 
 const DEFAULT_APPROVAL_TTL_MILLISECONDS = 10 * 60 * 1000;
 
@@ -77,7 +76,7 @@ export class PolicyEngine {
   async evaluate(request) {
     const actionName = requestValue(request, 'action');
     const action = typeof actionName === 'string' ? this.#registry.get(actionName) : undefined;
-    if (action === undefined || action.name !== ACTION_NAME) {
+    if (action === undefined) {
       return denied('unknown_action');
     }
 
@@ -98,13 +97,13 @@ export class PolicyEngine {
       return denied('project_not_allowed');
     }
 
-    let params;
+    let prepared;
     try {
-      params = await validateActionParams(action.name, requestParams, snapshot.root);
+      prepared = await this.#registry.prepare(action.name, requestParams, snapshot);
     } catch {
       return denied('invalid_parameters');
     }
-    if (!(await this.#credentialAvailable(action.credentialLabel))) {
+    if (!(await this.#credentialAvailable(action.credential))) {
       return Object.freeze({
         action: action.name,
         credentialLabel: action.credentialLabel,
@@ -114,7 +113,7 @@ export class PolicyEngine {
 
     let envelope;
     try {
-      envelope = this.#createEnvelope(action, agentId, params, snapshot);
+      envelope = this.#createEnvelope(action, agentId, prepared, snapshot);
     } catch {
       return denied('identity_unavailable');
     }
@@ -141,21 +140,29 @@ export class PolicyEngine {
     return denied('approval_unavailable');
   }
 
-  async #credentialAvailable(label) {
+  async #credentialAvailable(binding) {
     try {
-      if (this.#vault === null || typeof this.#vault !== 'object' || typeof this.#vault.list !== 'function') {
+      if (this.#vault === null || typeof this.#vault !== 'object') {
+        return false;
+      }
+      if (typeof this.#vault.getActiveCredentialBinding === 'function') {
+        return (await this.#vault.getActiveCredentialBinding(binding)) !== undefined;
+      }
+      if (typeof this.#vault.list !== 'function') {
         return false;
       }
       const credentials = await this.#vault.list();
       return Array.isArray(credentials) && credentials.some(
-        (credential) => credential?.label === label && credential?.status === 'active',
+        (credential) => credential?.label === binding.label
+          && credential?.provider === binding.provider
+          && credential?.status === 'active',
       );
     } catch {
       return false;
     }
   }
 
-  #createEnvelope(action, agentId, params, snapshot) {
+  #createEnvelope(action, agentId, prepared, snapshot) {
     const requestedAt = this.#timestamp();
     const nonce = this.#nonceGenerator();
     if (typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/u.test(nonce)) {
@@ -163,19 +170,18 @@ export class PolicyEngine {
     }
     const body = deepFreeze({
       action: action.name,
+      actionVersion: action.version,
       agent: {
         id: agentId,
         identity: this.#identity.fingerprint,
       },
       credentialLabel: action.credentialLabel,
+      credentialProvider: action.credential.provider,
       expiresAt: new Date(
         Date.parse(requestedAt) + this.#approvalTtlMilliseconds,
       ).toISOString(),
       nonce,
-      params: {
-        directory: params.directory,
-        project: params.project,
-      },
+      params: prepared.params,
       policyVersion: POLICY_VERSION,
       project: {
         commit: snapshot.commit,
@@ -185,10 +191,7 @@ export class PolicyEngine {
         root: snapshot.root,
       },
       requestedAt,
-      target: {
-        directory: params.directoryPath,
-        project: params.project,
-      },
+      target: prepared.target,
     });
     const signature = this.#identity.signCanonical(body);
 

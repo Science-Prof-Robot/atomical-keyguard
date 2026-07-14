@@ -162,6 +162,14 @@ function request(listener, path, options = {}) {
 
 function createUiFixture() {
   const calls = { deposits: [] };
+  const action = {
+    approval: 'always',
+    credential: { label: 'cloudflare-api-token', provider: 'cloudflare' },
+    credentialLabel: 'cloudflare-api-token',
+    name: 'cloudflare_pages_deploy',
+    params: { directory: 'relative_path', project: 'slug' },
+    version: 1,
+  };
   const credential = {
     createdAt: FIXED_TIME,
     instanceId: 'a'.repeat(32),
@@ -171,7 +179,20 @@ function createUiFixture() {
   };
   const app = {
     services: {
-      actionRegistry: { list: async () => [] },
+      actionRegistry: {
+        get: (name) => name === action.name ? action : undefined,
+        getCredentialBinding: ({ label, provider }) => (
+          label === action.credential.label && provider === action.credential.provider
+            ? action.credential
+            : undefined
+        ),
+        list: async () => [{
+          approval: action.approval,
+          name: action.name,
+          params: action.params,
+          version: action.version,
+        }],
+      },
       activity: { list: async () => [] },
       approvals: { approveOnce: async () => ({}), deny: async () => ({}), list: async () => [] },
       depositService: {

@@ -1,10 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, realpath, stat } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 
-import { sha256 } from '../core/canonical.mjs';
+import { canonicalJson, sha256 } from '../core/canonical.mjs';
 import { redactSensitiveOutput } from '../core/redaction.mjs';
-import { ACTION_NAME } from '../policy/action-registry.mjs';
 import { GitInspector } from '../project/git-inspector.mjs';
 import { JsonStore } from '../storage/json-store.mjs';
 import { defaultDataDirectory } from '../storage/sealed-vault.mjs';
@@ -12,12 +10,14 @@ import { defaultDataDirectory } from '../storage/sealed-vault.mjs';
 const STORE_VERSION = 1;
 const PROVIDER_STATUSES = new Set(['succeeded', 'failed', 'not_started']);
 const VERIFICATION_STATUSES = new Set(['verified', 'failed', 'not_run']);
+const MAX_ACTION_DATA_LENGTH = 32 * 1024;
 
 /**
  * Consumes exactly one approval, performs a second just-before-launch project
  * check, and produces a signed, output-free receipt for every provider path.
  */
 export class ExecutionService {
+  #actionRegistry;
   #activity;
   #approvals;
   #clock;
@@ -25,7 +25,6 @@ export class ExecutionService {
   #idGenerator;
   #identity;
   #memory;
-  #provider;
   #ready;
   #storagePath;
   #store;
@@ -44,7 +43,7 @@ export class ExecutionService {
     this.#vault = requiredDependency(options.vault, 'readForExecution', 'vault');
     this.#activity = requiredDependency(options.activity, 'append', 'activity service');
     this.#memory = requiredDependency(options.memory, 'createVerifiedCandidate', 'memory service');
-    this.#provider = requiredDependency(options.provider, 'execute', 'provider');
+    this.#actionRegistry = requiredActionRegistry(options.actionRegistry);
     this.#identity = options.identity;
     if (
       this.#identity === null
@@ -129,18 +128,25 @@ export class ExecutionService {
       status: 'started',
     });
 
-    if (!(await finalRevalidation(envelope.body, this.#gitInspector))) {
+    if (!this.#isRegisteredAction(envelope.body)) {
+      return this.#preparationFailure(context);
+    }
+
+    if (!(await finalRevalidation(envelope.body, this.#gitInspector, this.#actionRegistry))) {
       return this.#preparationFailure(context);
     }
 
     let secret;
     try {
-      secret = await this.#vault.readForExecution(envelope.body.credentialLabel);
+      secret = await this.#vault.readForExecution({
+        label: envelope.body.credentialLabel,
+        provider: envelope.body.credentialProvider,
+      });
     } catch {
       return this.#preparationFailure(context);
     }
 
-    if (!(await finalRevalidation(envelope.body, this.#gitInspector))) {
+    if (!(await finalRevalidation(envelope.body, this.#gitInspector, this.#actionRegistry))) {
       secret = undefined;
       return this.#preparationFailure(context);
     }
@@ -154,12 +160,7 @@ export class ExecutionService {
     });
     let providerResult;
     try {
-      providerResult = await this.#provider.execute({
-        directory: envelope.body.target.directory,
-        project: envelope.body.target.project,
-        projectRoot: envelope.body.project.root,
-        secret,
-      });
+      providerResult = await this.#actionRegistry.execute(envelope, secret);
     } catch (error) {
       providerResult = thrownProviderResult(error, secret);
     }
@@ -302,6 +303,7 @@ export class ExecutionService {
   }) {
     const body = {
       action: envelope.body.action,
+      actionVersion: envelope.body.actionVersion,
       agent: {
         id: envelope.body.agent.id,
         identity: envelope.body.agent.identity,
@@ -312,6 +314,7 @@ export class ExecutionService {
       },
       commit: envelope.body.project.commit,
       credentialLabel: envelope.body.credentialLabel,
+      credentialProvider: envelope.body.credentialProvider,
       dirtyTreeAllowed: envelope.body.project.dirty,
       id,
       provider: {
@@ -328,10 +331,7 @@ export class ExecutionService {
       },
       retryOf,
       secretExposedToModel: false,
-      target: {
-        directory: envelope.body.target.directory,
-        project: envelope.body.target.project,
-      },
+      target: cloneJson(envelope.body.target),
       timestamps: {
         executedAt: this.#timestamp(),
         requestedAt: envelope.body.requestedAt,
@@ -418,6 +418,18 @@ export class ExecutionService {
     return `receipt_${value}`;
   }
 
+  #isRegisteredAction(body) {
+    try {
+      const action = this.#actionRegistry.get(body.action);
+      return action !== undefined
+        && action.version === body.actionVersion
+        && action.credentialLabel === body.credentialLabel
+        && action.credential?.provider === body.credentialProvider;
+    } catch {
+      return false;
+    }
+  }
+
   #timestamp() {
     let now;
     try {
@@ -439,6 +451,19 @@ function emptyState() {
 function requiredDependency(value, method, name) {
   if (value === null || typeof value !== 'object' || typeof value[method] !== 'function') {
     throw new TypeError(`Execution service requires a ${name}.`);
+  }
+  return value;
+}
+
+function requiredActionRegistry(value) {
+  if (
+    value === null
+    || typeof value !== 'object'
+    || typeof value.execute !== 'function'
+    || typeof value.get !== 'function'
+    || typeof value.prepare !== 'function'
+  ) {
+    throw new TypeError('Execution service requires an action registry.');
   }
   return value;
 }
@@ -472,7 +497,7 @@ function validateEnvelopeBody(body, identity) {
   if (!isPlainObject(body)) {
     throw executionUnavailable();
   }
-  assertExactKeys(body, [
+  const legacyKeys = [
     'action',
     'agent',
     'credentialLabel',
@@ -483,20 +508,33 @@ function validateEnvelopeBody(body, identity) {
     'project',
     'requestedAt',
     'target',
-  ]);
+  ];
+  const keys = [
+    ...legacyKeys,
+    ...(Object.hasOwn(body, 'actionVersion') ? ['actionVersion'] : []),
+    ...(Object.hasOwn(body, 'credentialProvider') ? ['credentialProvider'] : []),
+  ];
+  assertExactKeys(body, keys);
   if (
-    body.action !== ACTION_NAME
-    || body.credentialLabel !== 'cloudflare-api-token'
+    !validActionName(body.action)
+    || !validCredentialLabel(body.credentialLabel)
     || typeof body.requestedAt !== 'string'
     || typeof body.expiresAt !== 'string'
   ) {
+    throw executionUnavailable();
+  }
+  if (Object.hasOwn(body, 'actionVersion') && !validActionVersion(body.actionVersion)) {
+    throw executionUnavailable();
+  }
+  if (Object.hasOwn(body, 'credentialProvider') && !validCredentialProvider(body.credentialProvider)) {
     throw executionUnavailable();
   }
   timestampMilliseconds(body.requestedAt);
   timestampMilliseconds(body.expiresAt);
   validateAgent(body.agent, identity);
   validateProject(body.project);
-  validateTarget(body.target);
+  validateActionData(body.params);
+  validateActionData(body.target);
 }
 
 function validateAgent(agent, identity) {
@@ -533,22 +571,7 @@ function validateProject(project) {
   }
 }
 
-function validateTarget(target) {
-  if (!isPlainObject(target)) {
-    throw executionUnavailable();
-  }
-  assertExactKeys(target, ['directory', 'project']);
-  if (
-    typeof target.directory !== 'string'
-    || !isAbsolute(target.directory)
-    || typeof target.project !== 'string'
-    || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(target.project)
-  ) {
-    throw executionUnavailable();
-  }
-}
-
-async function finalRevalidation(body, gitInspector) {
+async function finalRevalidation(body, gitInspector, actionRegistry) {
   try {
     const snapshot = await gitInspector.inspect(body.project.root);
     if (
@@ -560,30 +583,9 @@ async function finalRevalidation(body, gitInspector) {
     ) {
       return false;
     }
-    return await targetStillMatches(body.project.root, body.target.directory);
-  } catch {
-    return false;
-  }
-}
-
-async function targetStillMatches(canonicalRoot, signedTarget) {
-  try {
-    const resolvedRoot = await realpath(canonicalRoot);
-    const rootDetails = await lstat(canonicalRoot);
-    if (
-      resolvedRoot !== canonicalRoot
-      || !rootDetails.isDirectory()
-      || rootDetails.isSymbolicLink()
-    ) {
-      return false;
-    }
-    const resolvedTarget = await realpath(signedTarget);
-    const targetDetails = await lstat(signedTarget);
-    return resolvedTarget === signedTarget
-      && isContained(canonicalRoot, resolvedTarget)
-      && targetDetails.isDirectory()
-      && !targetDetails.isSymbolicLink()
-      && (await stat(resolvedTarget)).isDirectory();
+    const prepared = await actionRegistry.prepare(body.action, body.params, snapshot);
+    return sameCanonicalValue(prepared.params, body.params)
+      && sameCanonicalValue(prepared.target, body.target);
   } catch {
     return false;
   }
@@ -656,10 +658,12 @@ function validateState(state, identity) {
 
 const RECEIPT_KEYS = [
   'action',
+  'actionVersion',
   'agent',
   'approval',
   'commit',
   'credentialLabel',
+  'credentialProvider',
   'dirtyTreeAllowed',
   'id',
   'provider',
@@ -678,10 +682,14 @@ function validateReceipt(receipt, identity) {
   if (!isPlainObject(receipt)) {
     throw executionUnavailable();
   }
-  assertExactKeys(receipt, RECEIPT_KEYS);
+  const keys = RECEIPT_KEYS.filter((key) => (
+    (key !== 'actionVersion' || Object.hasOwn(receipt, 'actionVersion'))
+    && (key !== 'credentialProvider' || Object.hasOwn(receipt, 'credentialProvider'))
+  ));
+  assertExactKeys(receipt, keys);
   const body = receiptBody(receipt);
   if (
-    body.action !== ACTION_NAME
+    !validActionName(body.action)
     || !validId(body.id, 'receipt')
     || !validId(body.approval?.id, 'approval')
     || body.approval.status !== 'consumed'
@@ -691,7 +699,7 @@ function validateReceipt(receipt, identity) {
     || !validRequestSignature(body.request.signature)
     || typeof body.commit !== 'string'
     || !/^[a-f0-9]{40,64}$/u.test(body.commit)
-    || body.credentialLabel !== 'cloudflare-api-token'
+    || !validCredentialLabel(body.credentialLabel)
     || typeof body.dirtyTreeAllowed !== 'boolean'
     || body.secretExposedToModel !== false
     || (body.retryOf !== null && !validId(body.retryOf, 'receipt'))
@@ -699,9 +707,15 @@ function validateReceipt(receipt, identity) {
   ) {
     throw executionUnavailable();
   }
+  if (Object.hasOwn(body, 'actionVersion') && !validActionVersion(body.actionVersion)) {
+    throw executionUnavailable();
+  }
+  if (Object.hasOwn(body, 'credentialProvider') && !validCredentialProvider(body.credentialProvider)) {
+    throw executionUnavailable();
+  }
   validateAgent(body.agent, identity);
   validateRepository(body.repository);
-  validateTarget(body.target);
+  validateActionData(body.target);
   validateReceiptTimestamps(body.timestamps);
   validateStatus(body.provider, PROVIDER_STATUSES);
   validateStatus(body.verification, VERIFICATION_STATUSES);
@@ -776,6 +790,47 @@ function validRequestSignature(value) {
     && /^[A-Za-z0-9_-]+$/u.test(value.signature);
 }
 
+function validateActionData(value) {
+  if (!isPlainObject(value)) {
+    throw executionUnavailable();
+  }
+  try {
+    if (canonicalJson(value).length > MAX_ACTION_DATA_LENGTH) {
+      throw new Error('Action data is too large.');
+    }
+  } catch {
+    throw executionUnavailable();
+  }
+}
+
+function validActionName(value) {
+  return typeof value === 'string' && /^[a-z][a-z0-9_]{2,127}$/u.test(value);
+}
+
+function validActionVersion(value) {
+  return Number.isInteger(value) && value >= 1 && value <= 1_000_000;
+}
+
+function validCredentialLabel(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 128
+    && value === value.trim()
+    && !/[\u0000-\u001f]/u.test(value);
+}
+
+function validCredentialProvider(value) {
+  return typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/u.test(value);
+}
+
+function sameCanonicalValue(left, right) {
+  try {
+    return canonicalJson(left) === canonicalJson(right);
+  } catch {
+    return false;
+  }
+}
+
 function validId(value, prefix) {
   return typeof value === 'string' && new RegExp(`^${prefix}_[A-Za-z0-9_-]{8,128}$`, 'u').test(value);
 }
@@ -811,15 +866,6 @@ function assertExactKeys(value, expected) {
       throw executionUnavailable();
     }
   }
-}
-
-function isContained(root, candidate) {
-  const fromRoot = relative(root, candidate);
-  return fromRoot !== ''
-    && fromRoot !== '..'
-    && !fromRoot.startsWith(`..${String.fromCharCode(47)}`)
-    && !fromRoot.startsWith(`..${String.fromCharCode(92)}`)
-    && !isAbsolute(fromRoot);
 }
 
 function isPlainObject(value) {

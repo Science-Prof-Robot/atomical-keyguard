@@ -237,6 +237,44 @@ test('delegates a UI-only deposit link without exposing the deposited value', as
   });
 });
 
+test('projects generic installed actions and rejects uninstalled credential bindings before a handoff', async () => {
+  const fixture = createGenericIntegrationApp();
+  await withHttpServer(async ({ calls, listener }) => {
+    const session = await createSession(listener);
+    const actions = await requestJson(listener, '/api/actions');
+
+    assert.equal(actions.statusCode, 200);
+    assert.deepEqual(actions.body, {
+      items: [{
+        approval: 'always',
+        credential: { label: 'example-api-token', provider: 'example' },
+        name: 'example_publish',
+        params: { site: 'slug' },
+        version: 7,
+      }],
+    });
+
+    const unavailable = await requestJson(listener, '/api/deposit-link', {
+      body: { label: 'missing-api-token', provider: 'missing' },
+      headers: session.headers,
+      method: 'POST',
+      origin: listener.url,
+    });
+    assert.equal(unavailable.statusCode, 409);
+    assertSafeError(unavailable, 'not_installed');
+    assert.deepEqual(calls.deposits, []);
+
+    const available = await requestJson(listener, '/api/deposit-link', {
+      body: { label: 'example-api-token', provider: 'example' },
+      headers: session.headers,
+      method: 'POST',
+      origin: listener.url,
+    });
+    assert.equal(available.statusCode, 201);
+    assert.deepEqual(calls.deposits, [{ label: 'example-api-token', provider: 'example' }]);
+  }, fixture);
+});
+
 test('accepts a signed webhook without a UI session and returns only a credential projection', async () => {
   await withHttpServer(async ({ calls, listener }) => {
     const event = {
@@ -300,7 +338,6 @@ test('projects current list routes and invokes approval and memory mutations thr
           commit: 'c'.repeat(40),
           dirty: false,
           repositoryFingerprint: 'b'.repeat(64),
-          targetProject: 'keyguard-site',
         },
         requiresDirtyTreeAcknowledgement: false,
         status: 'pending',
@@ -320,8 +357,10 @@ test('projects current list routes and invokes approval and memory mutations thr
     assert.deepEqual(actions.body, {
       items: [{
         approval: 'always',
+        credential: { label: 'cloudflare-api-token', provider: 'cloudflare' },
         name: 'cloudflare_pages_deploy',
         params: { directory: 'relative_path', project: 'slug' },
+        version: 1,
       }],
     });
     assert.deepEqual(memory.body, {
@@ -822,7 +861,6 @@ function createFakeApp() {
       dirty: false,
       repositoryFingerprint: 'b'.repeat(64),
       root: `/private/${TEST_SECRET}`,
-      targetProject: 'keyguard-site',
     },
     reason: TEST_SECRET,
     requiresDirtyTreeAcknowledgement: false,
@@ -839,13 +877,28 @@ function createFakeApp() {
     text: 'Verified Cloudflare Pages deployment for keyguard-site at aaaaaaaaaaaa.',
     updatedAt: FIXED_TIME,
   };
+  const action = {
+    approval: 'always',
+    credential: { label: 'cloudflare-api-token', provider: 'cloudflare' },
+    credentialLabel: 'cloudflare-api-token',
+    execution: { args: [TEST_SECRET] },
+    name: 'cloudflare_pages_deploy',
+    params: { directory: 'relative_path', project: 'slug' },
+    version: 1,
+  };
   const services = {
     actionRegistry: {
+      get: (name) => name === action.name ? action : undefined,
+      getCredentialBinding: ({ label, provider }) => (
+        label === action.credential.label && provider === action.credential.provider
+          ? action.credential
+          : undefined
+      ),
       list: () => [{
-        approval: 'always',
-        execution: { args: [TEST_SECRET] },
-        name: 'cloudflare_pages_deploy',
-        params: { directory: 'relative_path', project: 'slug' },
+        approval: action.approval,
+        name: action.name,
+        params: action.params,
+        version: action.version,
       }],
     },
     activity: {
@@ -1016,6 +1069,31 @@ function createFakeApp() {
     },
   };
   return { app, calls, controls };
+}
+
+function createGenericIntegrationApp() {
+  const fixture = createFakeApp();
+  const action = {
+    approval: 'always',
+    credential: { label: 'example-api-token', provider: 'example' },
+    credentialLabel: 'example-api-token',
+    name: 'example_publish',
+    params: { site: 'slug' },
+    version: 7,
+  };
+  fixture.app.services.actionRegistry.get = (name) => name === action.name ? action : undefined;
+  fixture.app.services.actionRegistry.getCredentialBinding = ({ label, provider }) => (
+    label === action.credential.label && provider === action.credential.provider
+      ? action.credential
+      : undefined
+  );
+  fixture.app.services.actionRegistry.list = () => [{
+    approval: action.approval,
+    name: action.name,
+    params: action.params,
+    version: action.version,
+  }];
+  return fixture;
 }
 
 function normalizeSetCookie(value) {

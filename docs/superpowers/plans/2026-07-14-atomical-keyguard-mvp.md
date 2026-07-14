@@ -1,5 +1,7 @@
 # Atomical Keyguard MVP Implementation Plan
 
+> **⚠ Superseded — do not use as current product behavior.** This historical MVP plan describes the original fixed Cloudflare Pages action. Use the [vendor-neutral design](../specs/2026-07-14-vendor-neutral-keyguard-design.md) and [vendor-neutral implementation plan](2026-07-14-vendor-neutral-keyguard.md) for the current default-empty integration model.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a runnable local-first Atomical Keyguard MVP that stores credentials behind a sealed boundary, exposes only narrowly defined capabilities to an MCP client, requires exact human approval for a Cloudflare Pages deployment, and presents the approved lightweight control UI.

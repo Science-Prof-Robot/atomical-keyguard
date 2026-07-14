@@ -4,17 +4,65 @@ import { isAbsolute, relative } from 'node:path';
 import { promisify } from 'node:util';
 
 import { redactSensitiveOutput } from '../core/redaction.mjs';
+import { validateCloudflarePagesParams } from './cloudflare-pages-validation.mjs';
 
 const DEFAULT_TIMEOUT_MILLISECONDS = 120_000;
 const MAX_TIMEOUT_MILLISECONDS = 5 * 60 * 1000;
 const OUTPUT_LIMIT = 64 * 1024;
 const PROJECT_SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
+export const CLOUDFLARE_PAGES_ACTION = 'cloudflare_pages_deploy';
 
 const defaultRunner = promisify(execFile);
 
 /**
- * The only provider adapter in the MVP. The executable and every argument
- * other than daemon-validated target values are fixed in this module.
+ * Returns the optional, reviewed Cloudflare Pages integration. Calling this
+ * factory is the explicit opt-in; Keyguard never installs it by default.
+ */
+export function createCloudflarePagesIntegration(options = {}) {
+  const adapter = new CloudflarePagesAdapter(options);
+  return Object.freeze({
+    action: Object.freeze({
+      approval: 'always',
+      credential: Object.freeze({
+        label: 'cloudflare-api-token',
+        provider: 'cloudflare',
+      }),
+      name: CLOUDFLARE_PAGES_ACTION,
+      params: Object.freeze({
+        directory: 'relative_path',
+        project: 'slug',
+      }),
+      version: 1,
+    }),
+    async execute({ envelope, secret }) {
+      const body = envelope?.body ?? envelope;
+      return adapter.execute({
+        directory: body?.target?.directory,
+        project: body?.target?.project,
+        projectRoot: body?.project?.root,
+        secret,
+      });
+    },
+    async prepare({ params, projectRoot }) {
+      const prepared = await validateCloudflarePagesParams(params, projectRoot);
+      return {
+        params: {
+          directory: prepared.directory,
+          project: prepared.project,
+        },
+        target: {
+          directory: prepared.directoryPath,
+          project: prepared.project,
+        },
+      };
+    },
+  });
+}
+
+/**
+ * Fixed implementation used by the optional reviewed Cloudflare Pages
+ * integration. Every argument other than daemon-validated target values is
+ * fixed in this module.
  */
 export class CloudflarePagesAdapter {
   #runner;

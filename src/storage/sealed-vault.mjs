@@ -171,17 +171,48 @@ export class SealedVault {
     return state.credentials.map(project);
   }
 
-  async readForExecution(label) {
+  /**
+   * Returns the active opaque credential instance only when the caller's
+   * reviewed `{ label, provider }` binding matches the sealed metadata. This
+   * lets policy and approval services test a binding without reading a secret.
+   */
+  async getActiveCredentialBinding(binding) {
     await this.#ready;
-    const normalizedLabel = normalizeLabel(label);
+    const normalizedBinding = normalizeExecutionBinding(binding, { providerRequired: true });
     const state = await this.#readState();
-    const record = state.credentials.find((candidate) => candidate.label === normalizedLabel);
+    const record = state.credentials.find((candidate) => candidate.label === normalizedBinding.label);
+    if (record === undefined || record.status !== ACTIVE) {
+      return undefined;
+    }
+    const payload = this.#unseal(record);
+    if (payload.metadata.provider !== normalizedBinding.provider) {
+      return undefined;
+    }
+    return Object.freeze({
+      instanceId: record.instanceId,
+      label: normalizedBinding.label,
+      provider: normalizedBinding.provider,
+    });
+  }
+
+  async readForExecution(binding) {
+    await this.#ready;
+    const normalizedBinding = normalizeExecutionBinding(binding);
+    const state = await this.#readState();
+    const record = state.credentials.find((candidate) => candidate.label === normalizedBinding.label);
 
     if (record === undefined || record.status !== ACTIVE) {
       throw credentialUnavailable();
     }
 
-    return this.#unseal(record).secret;
+    const payload = this.#unseal(record);
+    if (
+      normalizedBinding.provider !== undefined
+      && payload.metadata.provider !== normalizedBinding.provider
+    ) {
+      throw credentialUnavailable();
+    }
+    return payload.secret;
   }
 
   async revoke(label) {
@@ -391,6 +422,28 @@ function normalizeLabel(label) {
     throw new TypeError('Credential label must be a non-empty printable string.');
   }
   return label;
+}
+
+function normalizeExecutionBinding(value, { providerRequired = false } = {}) {
+  if (typeof value === 'string') {
+    if (providerRequired) {
+      throw new TypeError('Credential provider binding is required.');
+    }
+    return Object.freeze({ label: normalizeLabel(value), provider: undefined });
+  }
+  if (!isPlainObject(value)) {
+    throw new TypeError('Credential execution binding must be a label or binding object.');
+  }
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 2 || keys[0] !== 'label' || keys[1] !== 'provider') {
+    throw new TypeError('Credential execution binding is invalid.');
+  }
+  const label = normalizeLabel(value.label);
+  const provider = value.provider;
+  if (typeof provider !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/u.test(provider)) {
+    throw new TypeError('Credential execution binding is invalid.');
+  }
+  return Object.freeze({ label, provider });
 }
 
 function normalizeSecret(secret) {

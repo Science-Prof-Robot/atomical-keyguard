@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 
-import { ACTION_NAME } from '../policy/action-registry.mjs';
 import { JsonStore } from '../storage/json-store.mjs';
 import { defaultDataDirectory } from '../storage/sealed-vault.mjs';
 
@@ -149,7 +148,7 @@ function validateRecord(record) {
   }
   assertExactKeys(record, ['action', 'id', 'receiptId', 'requestId', 'stage', 'status', 'timestamp']);
   if (
-    record.action !== ACTION_NAME
+    !validActionName(record.action)
     || typeof record.id !== 'string'
     || !/^activity_[A-Za-z0-9_-]{8,128}$/u.test(record.id)
     || typeof record.requestId !== 'string'
@@ -164,6 +163,10 @@ function validateRecord(record) {
     throw activityUnavailable();
   }
   timestampMilliseconds(record.timestamp);
+}
+
+function validActionName(value) {
+  return typeof value === 'string' && /^[a-z][a-z0-9_]{2,127}$/u.test(value);
 }
 
 function timestampMilliseconds(value) {

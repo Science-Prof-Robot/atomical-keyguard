@@ -20,17 +20,14 @@ const SIGNATURE_PATTERN = /^[A-Za-z0-9_-]{16,512}$/u;
 const CREDENTIAL_INSTANCE_ID_PATTERN = /^[A-Za-z0-9_-]{32}$/u;
 const HANDOFF_STATUSES = new Set(['pending', 'claimed']);
 const VAULT_CREDENTIAL_STATUSES = new Set(['active', 'revoked']);
-const SUPPORTED_METADATA = Object.freeze({
-  label: 'cloudflare-api-token',
-  provider: 'cloudflare',
-});
 
 /**
  * Seals a one-time, signed credential handoff without retaining either its
- * external URL or credential value. The only supported current credential is
- * the daemon-owned Cloudflare Pages token mapping.
+ * external URL or credential value. Credential handoffs are available only
+ * for a credential binding declared by an installed reviewed integration.
  */
 export class DepositService {
+  #actionRegistry;
   #atomicalGateway;
   #clock;
   #depositTtlMilliseconds;
@@ -53,6 +50,15 @@ export class DepositService {
       throw new TypeError('dataDirectory must be a non-empty string.');
     }
     this.#storagePath = resolve(options.storagePath ?? join(dataDirectory, 'deposits.json'));
+
+    this.#actionRegistry = options.actionRegistry ?? emptyActionRegistry();
+    if (
+      this.#actionRegistry === null
+      || typeof this.#actionRegistry !== 'object'
+      || typeof this.#actionRegistry.getCredentialBinding !== 'function'
+    ) {
+      throw new TypeError('actionRegistry.getCredentialBinding must be a function.');
+    }
 
     this.#clock = options.clock ?? { now: () => new Date() };
     if (this.#clock === null || typeof this.#clock.now !== 'function') {
@@ -144,6 +150,9 @@ export class DepositService {
       await this.#ready;
       await this.#reconcileHandoffs();
       const normalizedMetadata = normalizeMetadata(metadata);
+      if (!this.#isRegisteredCredential(normalizedMetadata)) {
+        throw unavailable();
+      }
       const expectedInstanceId = await this.#captureExpectedInstanceId(normalizedMetadata.label);
       const now = this.#now();
       const record = {
@@ -206,6 +215,7 @@ export class DepositService {
         projections = Object.freeze(
           state.handoffs
             .filter((handoff) => handoff.status === 'pending')
+            .filter((handoff) => this.#isRegisteredCredential(handoff.metadata))
             .map((handoff) => projectHandoff(handoff)),
         );
         return state;
@@ -351,6 +361,7 @@ export class DepositService {
         index === -1
         || state.handoffs[index].status !== 'pending'
         || state.handoffs[index].metadata.label !== event.label
+        || !this.#isRegisteredCredential(state.handoffs[index].metadata)
       ) {
         throw unavailable();
       }
@@ -379,6 +390,17 @@ export class DepositService {
     return handoffId;
   }
 
+  #isRegisteredCredential(metadata) {
+    try {
+      const binding = this.#actionRegistry.getCredentialBinding(metadata);
+      return binding !== undefined
+        && binding.label === metadata.label
+        && binding.provider === metadata.provider;
+    } catch {
+      return false;
+    }
+  }
+
   #now() {
     const now = this.#clock.now();
     if (!(now instanceof Date) || Number.isNaN(now.valueOf())) {
@@ -392,12 +414,20 @@ function emptyState() {
   return { handoffs: [], version: STORE_VERSION };
 }
 
+function emptyActionRegistry() {
+  return Object.freeze({
+    getCredentialBinding() {
+      return undefined;
+    },
+  });
+}
+
 function normalizeMetadata(value) {
   assertPlainObject(value);
-  assertAllowedKeys(value, ['label', 'provider']);
+  assertExactKeys(value, ['label', 'provider']);
   const label = ownDataProperty(value, 'label');
-  const provider = Object.hasOwn(value, 'provider') ? ownDataProperty(value, 'provider') : SUPPORTED_METADATA.provider;
-  if (label !== SUPPORTED_METADATA.label || provider !== SUPPORTED_METADATA.provider) {
+  const provider = ownDataProperty(value, 'provider');
+  if (!validCredentialLabel(label) || !validProvider(provider)) {
     throw unavailable();
   }
   return Object.freeze({ label, provider });
@@ -412,7 +442,7 @@ function normalizeEvent(value) {
   const type = ownDataProperty(value, 'type');
   if (
     !HANDOFF_ID_PATTERN.test(handoffId)
-    || label !== SUPPORTED_METADATA.label
+    || !validCredentialLabel(label)
     || typeof secret !== 'string'
     || secret.length === 0
     || secret.length > MAX_SECRET_LENGTH
@@ -610,6 +640,18 @@ function normalizeVaultCredentialState(value) {
   return Object.freeze({ instanceId, label, status });
 }
 
+function validCredentialLabel(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 128
+    && value === value.trim()
+    && !/[\u0000-\u001f]/u.test(value);
+}
+
+function validProvider(value) {
+  return typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/u.test(value);
+}
+
 function expectedCredentialIsStillCurrent(handoff, credentialsByLabel) {
   const current = credentialsByLabel.get(handoff.metadata.label);
   if (handoff.expectedInstanceId === null) {
@@ -639,18 +681,6 @@ function timestampMilliseconds(value) {
     throw unavailable();
   }
   return timestamp.valueOf();
-}
-
-function assertAllowedKeys(value, allowed) {
-  for (const key of Object.keys(value)) {
-    if (!allowed.includes(key)) {
-      throw unavailable();
-    }
-    ownDataProperty(value, key);
-  }
-  if (!Object.hasOwn(value, 'label')) {
-    throw unavailable();
-  }
 }
 
 function assertExactKeys(value, expected) {

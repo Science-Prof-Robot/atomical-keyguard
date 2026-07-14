@@ -18,13 +18,14 @@ test('renders an explicit safe stop for undocumented providers in agent artifact
   const manual = renderFieldManual();
 
   assert.match(manual, /Undocumented services or providers/);
-  assert.match(manual, /field manual and present in Keyguard's current action registry/);
+  assert.match(manual, /absent from\s+either this field manual or Keyguard's current action registry/);
   assert.match(manual, /Do not guess its API, CLI, MCP setup/);
   assert.match(manual, /\[Atomical\]\(https:\/\/atomical\.dev\/\)/);
 
   for (const host of ['claude', 'codex']) {
     assert.match(renderSkillTemplate(host), /Undocumented services or providers/);
     assert.match(renderSkillTemplate(host), /requested service, provider, credential flow, or workflow/i);
+    assert.match(renderSkillTemplate(host), /absent from\s+either the field manual or Keyguard's current action registry/i);
     assert.match(renderSkillTemplate(host), /ask for official provider documentation/i);
     assert.match(renderGuidanceShim(host), /undocumented provider/i);
   }

@@ -3,7 +3,6 @@ import { createHttpServer as createLoopbackHttpServer } from './http/server.mjs'
 import { createMcpStdioServer } from './mcp/stdio-server.mjs';
 import { createActionRegistry } from './policy/action-registry.mjs';
 import { PolicyEngine } from './policy/policy-engine.mjs';
-import { CloudflarePagesAdapter } from './providers/cloudflare-pages.mjs';
 import { GitInspector } from './project/git-inspector.mjs';
 import { ActivityService } from './services/activity.mjs';
 import { ApprovalService } from './services/approvals.mjs';
@@ -42,13 +41,10 @@ export async function createKeyguardApp(options = {}) {
   ) {
     throw new TypeError('setup service must provide complete and status methods.');
   }
-  const actionRegistry = options.actionRegistry ?? createActionRegistry(
-    options.approvedProjectRoots === undefined
-      ? {}
-      : { approvedProjectRoots: options.approvedProjectRoots },
-  );
+  const actionRegistry = options.actionRegistry ?? createActionRegistry(actionRegistryOptions(options));
   const gitInspector = options.gitInspector ?? new GitInspector();
   const approvals = options.approvals ?? await ApprovalService.open({
+    actionRegistry,
     clock: options.clock,
     dataDirectory: options.dataDirectory,
     gitInspector,
@@ -63,10 +59,6 @@ export async function createKeyguardApp(options = {}) {
     registry: actionRegistry,
     vault,
   });
-  const provider = options.provider ?? new CloudflarePagesAdapter({
-    runner: options.providerRunner,
-    timeoutMilliseconds: options.providerTimeoutMilliseconds,
-  });
   const activity = options.activity ?? await ActivityService.open({
     clock: options.clock,
     dataDirectory: options.dataDirectory,
@@ -77,6 +69,7 @@ export async function createKeyguardApp(options = {}) {
     identity,
   });
   const execution = options.execution ?? await ExecutionService.open({
+    actionRegistry,
     activity,
     approvals,
     clock: options.clock,
@@ -84,7 +77,6 @@ export async function createKeyguardApp(options = {}) {
     gitInspector,
     identity,
     memory,
-    provider,
     vault,
     verifier: options.verifier,
   });
@@ -94,6 +86,7 @@ export async function createKeyguardApp(options = {}) {
     kind: 'sealed-local-test-demo',
   });
   const depositService = options.depositService ?? options.deposits ?? await DepositService.open({
+    actionRegistry,
     atomicalGateway,
     clock: options.clock,
     dataDirectory: options.dataDirectory,
@@ -151,8 +144,6 @@ export async function createKeyguardApp(options = {}) {
     installerControl,
     memory,
     policyEngine,
-    provider,
-    providerRunner: options.providerRunner,
     setup,
     vault,
   });
@@ -240,6 +231,17 @@ export async function createKeyguardApp(options = {}) {
     },
   });
   return app;
+}
+
+function actionRegistryOptions(options) {
+  const registryOptions = {};
+  if (options.approvedProjectRoots !== undefined) {
+    registryOptions.approvedProjectRoots = options.approvedProjectRoots;
+  }
+  if (options.integrations !== undefined) {
+    registryOptions.integrations = options.integrations;
+  }
+  return registryOptions;
 }
 
 function publicFingerprint(identity) {

@@ -81,14 +81,17 @@ test('returns only secret-free structured tool results and never executes or del
   assert.deepEqual(structured(responses[2]), {
     actions: [{
       approval: 'always',
+      credential: { label: 'cloudflare-api-token', provider: 'cloudflare' },
       name: 'cloudflare_pages_deploy',
       params: { directory: 'relative_path', project: 'slug' },
+      version: 1,
     }],
   });
   assert.deepEqual(structured(responses[3]), {
     label: 'cloudflare-api-token',
+    provider: 'cloudflare',
     status: 'ui_required',
-    ui: { path: '/?intent=create_deposit_link&label=cloudflare-api-token' },
+    ui: { path: '/?intent=create_deposit_link&label=cloudflare-api-token&provider=cloudflare' },
   });
   assert.deepEqual(structured(responses[4]), {
     action: 'cloudflare_pages_deploy',
@@ -193,10 +196,91 @@ test('returns a local deposit UI intent without invoking the deposit service', a
 
   assert.deepEqual(structured(responses[0]), {
     label: 'cloudflare-api-token',
+    provider: 'cloudflare',
     status: 'ui_required',
-    ui: { path: '/?intent=create_deposit_link&label=cloudflare-api-token' },
+    ui: { path: '/?intent=create_deposit_link&label=cloudflare-api-token&provider=cloudflare' },
   });
   assert.deepEqual(calls.deposits, []);
+  assertSafeOutput(responses);
+});
+
+test('uses the runtime registry for generic capabilities and stops cleanly for absent ones', async () => {
+  const { app, calls, controls } = createGenericIntegrationApp();
+  controls.policyDecision = {
+    requestId: 'approval_12345678',
+    requiresDirtyTreeAcknowledgement: false,
+    status: 'approval_required',
+  };
+
+  const responses = await runLines(app, [
+    request(1, 'tools/list', {}),
+    request(2, 'tools/call', { arguments: {}, name: 'list_actions' }),
+    request(3, 'tools/call', {
+      arguments: { label: 'missing-api-token', provider: 'missing' },
+      name: 'create_deposit_link',
+    }),
+    request(4, 'tools/call', {
+      arguments: {
+        action: 'missing_publish',
+        agentId: 'codex-test-agent',
+        params: { site: 'preview' },
+        projectRoot: '/approved/repository',
+      },
+      name: 'execute_action',
+    }),
+    request(5, 'tools/call', {
+      arguments: { label: 'example-api-token', provider: 'example' },
+      name: 'create_deposit_link',
+    }),
+    request(6, 'tools/call', {
+      arguments: {
+        action: 'example_publish',
+        agentId: 'codex-test-agent',
+        params: { site: 'preview' },
+        projectRoot: '/approved/repository',
+      },
+      name: 'execute_action',
+    }),
+  ]);
+
+  const executeTool = responses[0].result.tools.find((tool) => tool.name === 'execute_action');
+  assert.equal(executeTool.inputSchema.properties.action.const, undefined);
+  assert.deepEqual(structured(responses[1]), {
+    actions: [{
+      approval: 'always',
+      credential: { label: 'example-api-token', provider: 'example' },
+      name: 'example_publish',
+      params: { site: 'slug' },
+      version: 7,
+    }],
+  });
+  assert.deepEqual(structured(responses[2]), {
+    label: 'missing-api-token',
+    message: 'This credential binding is not installed in this Keyguard profile.',
+    provider: 'missing',
+    status: 'not_installed',
+  });
+  assert.deepEqual(structured(responses[3]), {
+    action: 'missing_publish',
+    message: 'This action is not installed in this Keyguard profile.',
+    status: 'not_installed',
+  });
+  assert.deepEqual(structured(responses[4]), {
+    label: 'example-api-token',
+    provider: 'example',
+    status: 'ui_required',
+    ui: { path: '/?intent=create_deposit_link&label=example-api-token&provider=example' },
+  });
+  assert.deepEqual(structured(responses[5]), {
+    action: 'example_publish',
+    credentialLabel: 'example-api-token',
+    requestId: 'approval_12345678',
+    requiresDirtyTreeAcknowledgement: false,
+    status: 'approval_required',
+  });
+  assert.deepEqual(calls.deposits, []);
+  assert.equal(calls.policyRequests.length, 1);
+  assert.equal(calls.policyRequests[0].action, 'example_publish');
   assertSafeOutput(responses);
 });
 
@@ -577,15 +661,27 @@ function createFakeApp() {
   };
   const action = {
     approval: 'always',
+    credential: { label: 'cloudflare-api-token', provider: 'cloudflare' },
     credentialLabel: 'cloudflare-api-token',
     execution: { environment: { CLOUDFLARE_API_TOKEN: SECRET } },
     name: 'cloudflare_pages_deploy',
     params: { directory: 'relative_path', project: 'slug' },
+    version: 1,
   };
   const services = {
     actionRegistry: {
       get: (name) => name === 'cloudflare_pages_deploy' ? action : undefined,
-      list: () => [action],
+      getCredentialBinding: ({ label, provider }) => (
+        label === action.credential.label && provider === action.credential.provider
+          ? action.credential
+          : undefined
+      ),
+      list: () => [{
+        approval: action.approval,
+        name: action.name,
+        params: action.params,
+        version: action.version,
+      }],
     },
     depositService: {
       create: async (metadata) => {
@@ -652,6 +748,31 @@ function createFakeApp() {
     },
   };
   return { app, calls, controls };
+}
+
+function createGenericIntegrationApp() {
+  const fixture = createFakeApp();
+  const action = {
+    approval: 'always',
+    credential: { label: 'example-api-token', provider: 'example' },
+    credentialLabel: 'example-api-token',
+    name: 'example_publish',
+    params: { site: 'slug' },
+    version: 7,
+  };
+  fixture.app.services.actionRegistry.get = (name) => name === action.name ? action : undefined;
+  fixture.app.services.actionRegistry.getCredentialBinding = ({ label, provider }) => (
+    label === action.credential.label && provider === action.credential.provider
+      ? action.credential
+      : undefined
+  );
+  fixture.app.services.actionRegistry.list = () => [{
+    approval: action.approval,
+    name: action.name,
+    params: action.params,
+    version: action.version,
+  }];
+  return fixture;
 }
 
 function assertSafeOutput(value) {

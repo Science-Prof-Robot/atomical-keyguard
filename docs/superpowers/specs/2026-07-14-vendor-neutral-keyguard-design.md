@@ -35,12 +35,17 @@ handoff bindings. Each integration contributes one or more actions with:
 - public, bounded parameter schema metadata;
 - a trusted `prepare` function that turns a request into canonical signed
   params and target data;
-- trusted revalidation, execution, and verification functions.
+- a trusted `execute` function; Keyguard core invokes its configured safe
+  verification hook from the resulting signed receipt.
 
-The policy engine signs the prepared action name, version, credential label,
-params, target, repository snapshot, expiry, and nonce. Approval, execution,
-receipt, activity, and memory validation use generic action identifiers and
-canonical data, never a Cloudflare-specific constant.
+The policy engine signs the prepared action name, version, complete credential
+binding (label and provider), params, target, repository snapshot, expiry, and
+nonce. Approval and execution compare that binding against the currently
+installed action. The sealed vault releases a secret only for the same binding.
+Execution re-runs the adapter's trusted `prepare` function and compares its
+canonical params/target immediately before secret access and again before
+launch. Receipt, activity, and memory validation use generic action identifiers
+and canonical data, never a Cloudflare-specific constant.
 
 The registry starts empty. `list_actions` returns `[]`; no runner is created
 or invoked. A configured Cloudflare integration preserves its fixed `execFile`

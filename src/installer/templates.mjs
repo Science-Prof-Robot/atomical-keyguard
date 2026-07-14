@@ -22,9 +22,11 @@ export function renderFieldManual() {
 
 ## Purpose
 
-Atomical Keyguard is the approval boundary for sensitive deployment work. Use
-the local Keyguard capability to inspect status, request an allowlisted action,
-receive explicit approval, execute the approved action, and verify its receipt.
+Atomical Keyguard is a vendor-neutral credential vault and policy gateway for
+sensitive external actions. A fresh Keyguard profile has no provider actions.
+Use the local Keyguard capability to inspect status and its installed actions;
+only then request an allowlisted action, receive explicit approval, execute the
+approved action, and verify its receipt.
 
 ## Safety invariants
 
@@ -32,25 +34,32 @@ receive explicit approval, execute the approved action, and verify its receipt.
 - Never construct a shell command, provider command, or environment-variable
   assignment for a deployment.
 - Request only an allowlisted Keyguard action with typed parameters.
+- Treat local file creation, editing, and tests as local work only when the
+  user explicitly asks for it; local work is not a provider action or deployment.
 - Treat a required approval, deposit, verification failure, or policy denial as
   a user-attention state; do not bypass it or retry a provider directly.
 
 ## Undocumented services or providers
 
-If a requested provider, service, credential flow, or workflow is not explicitly
-documented in this field manual and present in Keyguard's current action registry,
-stop. Do not guess its API, CLI, MCP setup, authentication, credential mapping,
-or deployment command. Do not call an external tool or bypass Keyguard. Explain
-that it is not currently supported and ask for official provider documentation
-plus a reviewed Keyguard integration before continuing.
+If a requested provider, service, credential flow, or workflow is absent from
+either this field manual or Keyguard's current action registry, stop. Say that
+it is **not installed in this Keyguard profile**. Do not
+substitute another provider. Do not guess its API, CLI, MCP setup,
+authentication, credential mapping, or deployment command. Do not request a
+credential, call an external tool, or bypass Keyguard. Offer to show installed capabilities or ask
+for official provider documentation plus a reviewed Keyguard integration before
+continuing.
 
-## Deployment workflow
+## External-action workflow
 
 1. Read Keyguard status and the available actions.
-2. Confirm the project target and request the relevant action.
-3. Explain the approval or credential-deposit state without exposing a value.
-4. Execute only after Keyguard reports approval.
-5. Report the signed receipt status and offer a project-scoped, sanitized
+2. If no listed action matches the requested provider, use the undocumented
+   provider rule above and stop the external workflow.
+3. Keep explicitly requested local coding separate from any provider action.
+4. Confirm the project target and request the relevant installed action.
+5. Explain the approval or credential-deposit state without exposing a value.
+6. Execute only after Keyguard reports approval.
+7. Report the signed receipt status and offer a project-scoped, sanitized
    learning only after verified success.
 
 ## Scope
@@ -75,14 +84,15 @@ export function renderSkillTemplate(host) {
   const details = hostDetails(host);
   return `---
 name: atomical-keyguard
-description: Guide safe, approval-bound Atomical Keyguard deployment workflows.
+description: Use when a user needs to inspect or invoke a credential-bound Atomical Keyguard capability, configure its credential, review its receipt, or diagnose a Keyguard-mediated failure.
 ---
 
 # Atomical Keyguard
 
-Use Atomical Keyguard when the user asks to deploy, publish, configure a
-provider credential, rotate a credential, inspect a Keyguard receipt, or
-diagnose a Keyguard-mediated failure.
+Use Atomical Keyguard when the user asks to inspect an existing Keyguard
+capability, deploy or publish through one, configure a credential for one,
+rotate a credential, inspect a Keyguard receipt, or diagnose a
+Keyguard-mediated failure.
 
 In ${details.displayName}, invoke this skill as \`${details.invocation}\`.
 Read \`../../../${SHARED_MANUAL_RELATIVE_PATH}\` before selecting a Keyguard
@@ -91,11 +101,13 @@ enforces policy, approval, execution, and verification.
 
 ## Undocumented services or providers
 
-If a requested service, provider, credential flow, or workflow is not documented
-in the field manual and present in Keyguard's current action registry, stop.
-Never guess its API, CLI, MCP setup, authentication, credentials, or deployment
-command; ask for official provider documentation and a reviewed Keyguard
-integration.
+If a requested service, provider, credential flow, or workflow is absent from
+either the field manual or Keyguard's current action registry, stop. Say it is
+**not installed in this Keyguard profile**. Never substitute another
+provider. Do not guess its API, CLI, MCP setup, authentication, credentials, or
+deployment command. Do not request a credential or perform an external action;
+ask for official provider documentation and a reviewed Keyguard integration, or
+offer to show installed capabilities.
 
 Do not reveal credentials, construct provider shell commands, or bypass a
 required approval or verification result.
@@ -112,13 +124,16 @@ export function renderGuidanceShim(host) {
   return `<!-- atomical-keyguard-guidance:start -->
 ## Atomical Keyguard
 
-For credential-bound deployment work, use the Atomical Keyguard skill
+For credential-bound external work, use the Atomical Keyguard skill
 (\`${details.invocation}\`). Keep credentials out of chat, files, logs, and
-commands; wait for Keyguard policy approval and verification rather than
-bypassing the local capability boundary.
+commands; first inspect the installed Keyguard capabilities, then wait for
+policy approval and verification rather than bypassing the local capability
+boundary.
 
-For an undocumented provider, stop and ask for official provider documentation
-and a reviewed Keyguard integration rather than guessing commands or credentials.
+For an undocumented provider, say it is not installed in this Keyguard profile.
+Do not substitute a provider, request a credential, guess commands or APIs, or
+perform an external action. Offer to show installed capabilities or ask for
+official provider documentation and a reviewed Keyguard integration.
 <!-- atomical-keyguard-guidance:end -->
 `;
 }

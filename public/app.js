@@ -5,17 +5,20 @@ const HOME_SECTIONS = Object.freeze([
   { section: 'attention', title: 'attention needed' },
   { section: 'approvals', title: 'approvals' },
   { section: 'credentials', title: 'credentials' },
+  { section: 'actions', title: 'integrations' },
   { section: 'activity', title: 'recent activity' },
   { section: 'memory', title: 'memory · continuous' },
 ]);
 
 const state = {
   activity: [],
+  actions: [],
   approvals: [],
   credentials: [],
   deposit: null,
   depositExpiryTimer: null,
   depositPollTimer: null,
+  depositIntentHandled: false,
   disclosures: new Map(),
   error: null,
   execution: new Map(),
@@ -140,7 +143,10 @@ async function handleAction(target) {
     return;
   }
   if (action === 'create-deposit') {
-    await perform('Creating a one-time handoff…', createDeposit);
+    await perform(
+      'Creating a one-time handoff…',
+      () => createDeposit(target.dataset.label, target.dataset.provider),
+    );
     return;
   }
   if (action === 'clear-deposit') {
@@ -185,9 +191,10 @@ async function perform(message, operation) {
 
 async function refresh() {
   expireDepositIfNeeded();
-  const [status, credentials, approvals, activity, memory, skill] = await Promise.all([
+  const [status, credentials, actions, approvals, activity, memory, skill] = await Promise.all([
     requestApi('/api/status'),
     requestApi('/api/credentials'),
+    requestApi('/api/actions'),
     requestApi('/api/approvals'),
     requestApi('/api/activity'),
     requestApi('/api/memory'),
@@ -198,11 +205,13 @@ async function refresh() {
   }
   state.status = status;
   state.credentials = arrayValue(credentials.items);
+  state.actions = actionArray(actions.items);
   state.approvals = arrayValue(approvals.items);
   state.activity = arrayValue(activity.items);
   state.memory = arrayValue(memory.items);
   synchronizeSetupHosts(skill);
   state.skill = freezeSkillStatus(skill);
+  applyDepositIntent();
 
   if (state.deposit !== null && state.credentials.some((credential) => (
     credential.label === state.deposit.label && credential.status === 'active'
@@ -210,6 +219,25 @@ async function refresh() {
     clearDeposit();
     state.message = 'Credential sealed. The one-time handoff has been cleared from this page.';
   }
+}
+
+function applyDepositIntent() {
+  if (state.depositIntentHandled) {
+    return;
+  }
+  state.depositIntentHandled = true;
+  const query = new URL(window.location.href).searchParams;
+  if (query.get('intent') !== 'create_deposit_link') {
+    return;
+  }
+  const binding = installedCredentialBinding(query.get('label'), query.get('provider'));
+  if (binding === null) {
+    state.message = 'That credential binding is not installed in this Keyguard profile.';
+    return;
+  }
+  state.message = hasActiveCredentialFor(binding.label)
+    ? 'The requested credential is already sealed for this installed integration.'
+    : 'The requested credential is installed. Create its one-time handoff from the integration card.';
 }
 
 async function completeSetup() {
@@ -266,13 +294,17 @@ async function installSkill() {
   await completeSetup();
 }
 
-async function createDeposit() {
+async function createDeposit(label, provider) {
+  const credential = installedCredentialBinding(label, provider);
+  if (credential === null) {
+    throw new Error('Credential binding is not installed.');
+  }
   const response = await requestApi('/api/deposit-link', {
-    body: { label: 'cloudflare-api-token', provider: 'cloudflare' },
+    body: { label: credential.label, provider: credential.provider },
     method: 'POST',
   });
   const deposit = response.deposit;
-  if (!isPendingDeposit(deposit)) {
+  if (!isPendingDeposit(deposit) || deposit.label !== credential.label) {
     throw new Error('Deposit response was unavailable.');
   }
   clearDeposit();
@@ -717,6 +749,7 @@ function sectionCount(name, content) {
   }
   if (name === 'approvals') return String(state.approvals.length);
   if (name === 'credentials') return String(state.credentials.length);
+  if (name === 'actions') return String(state.actions.length);
   if (name === 'activity') return String(state.activity.length);
   if (name === 'memory') return String(state.memory.length);
   return '0';
@@ -739,6 +772,9 @@ function sectionContent(name) {
   }
   if (name === 'credentials') {
     return credentialsContent();
+  }
+  if (name === 'actions') {
+    return integrationsContent();
   }
   if (name === 'activity') {
     return state.activity.length === 0 ? emptyState('Meaningful milestones will appear here.') : state.activity.map(activityRow).join('');
@@ -776,7 +812,7 @@ function approvalCard(approval, attention) {
   const dirtyAcknowledgement = isPending && approval.requiresDirtyTreeAcknowledgement === true
     ? `<label class="check"><input id="${escapeAttribute(dirtyId)}" type="checkbox"> I understand this action uses a dirty tree once.</label>`
     : '';
-  return `<article class="approval-card ${attention ? 'attention-card' : ''}"${execution?.stage === 'preparing' ? ' aria-busy="true"' : ''}><p class="status-line">${escapeHtml(stringValue(approval.status, 'pending'))}</p><h2>${escapeHtml(title)}</h2><dl class="facts"><div><dt>credential</dt><dd>${escapeHtml(stringValue(approval.credentialLabel, 'unavailable'))}</dd></div><div><dt>target</dt><dd>${escapeHtml(stringValue(project?.targetProject, 'local project'))}</dd></div><div><dt>commit</dt><dd class="mono">${escapeHtml(shortValue(stringValue(project?.commit, 'unavailable')))}</dd></div><div><dt>expires</dt><dd>${escapeHtml(formatTime(approval.expiresAt))}</dd></div></dl>${executionStatusView(execution)}${dirtyAcknowledgement}<details class="technical" data-disclosure-key="${escapeAttribute(disclosureKey)}"${technicalOpen ? ' open' : ''}><summary aria-expanded="${technicalOpen}">technical envelope</summary><p class="mono">request ▸ ${escapeHtml(id)}</p></details>${actions}</article>`;
+  return `<article class="approval-card ${attention ? 'attention-card' : ''}"${execution?.stage === 'preparing' ? ' aria-busy="true"' : ''}><p class="status-line">${escapeHtml(stringValue(approval.status, 'pending'))}</p><h2>${escapeHtml(title)}</h2><dl class="facts"><div><dt>credential</dt><dd>${escapeHtml(stringValue(approval.credentialLabel, 'unavailable'))}</dd></div><div><dt>commit</dt><dd class="mono">${escapeHtml(shortValue(stringValue(project?.commit, 'unavailable')))}</dd></div><div><dt>expires</dt><dd>${escapeHtml(formatTime(approval.expiresAt))}</dd></div></dl>${executionStatusView(execution)}${dirtyAcknowledgement}<details class="technical" data-disclosure-key="${escapeAttribute(disclosureKey)}"${technicalOpen ? ' open' : ''}><summary aria-expanded="${technicalOpen}">technical envelope</summary><p class="mono">request ▸ ${escapeHtml(id)}</p></details>${actions}</article>`;
 }
 
 function executionStatusView(execution) {
@@ -813,8 +849,56 @@ function executionStatusLabel(status) {
 function credentialsContent() {
   const rows = state.credentials.map(credentialCard).join('');
   const hasActiveCredential = state.credentials.some((credential) => credential.status === 'active');
-  const primary = `<article class="credential-needed"><p class="status-line">credential needed</p><h2>Deposit a credential</h2><p>one-time · scoped · expires in 10m</p><button class="button primary" type="button" data-action="create-deposit">Create deposit link</button></article>`;
-  return `${rows}${state.deposit === null && !hasActiveCredential ? primary : ''}`;
+  if (rows.length > 0) {
+    return rows;
+  }
+  return hasActiveCredential
+    ? emptyState('No active credential is available for an installed integration.')
+    : emptyState('No sealed credentials yet.');
+}
+
+function integrationsContent() {
+  if (state.actions.length === 0) {
+    return emptyState('No integrations enabled. Keyguard will not create a credential handoff or run an external action until a reviewed integration is installed.');
+  }
+  return state.actions.map(integrationCard).join('');
+}
+
+function integrationCard(action) {
+  const credential = action.credential;
+  const active = hasActiveCredentialFor(credential.label);
+  const parameterNames = Object.keys(action.params);
+  const parameters = parameterNames.length === 0 ? 'no parameters' : parameterNames.join(', ');
+  const handoff = active
+    ? '<p class="quiet">sealed credential ready</p>'
+    : `<button class="button primary" type="button" data-action="create-deposit" data-label="${escapeAttribute(credential.label)}" data-provider="${escapeAttribute(credential.provider)}">Create deposit link</button>`;
+  return `<article class="integration-card"><p class="status-line">installed · approval required</p><h2>${escapeHtml(actionDisplayName(action.name))}</h2><dl class="facts"><div><dt>credential</dt><dd>${escapeHtml(credential.label)}</dd></div><div><dt>provider</dt><dd>${escapeHtml(credential.provider)}</dd></div><div><dt>parameters</dt><dd>${escapeHtml(parameters)}</dd></div><div><dt>version</dt><dd>${escapeHtml(String(action.version))}</dd></div></dl><div class="actions">${handoff}</div></article>`;
+}
+
+function hasActiveCredentialFor(label) {
+  return state.credentials.some((credential) => (
+    credential.label === label && credential.status === 'active'
+  ));
+}
+
+function installedCredentialBinding(label, provider) {
+  if (typeof label !== 'string' || typeof provider !== 'string') {
+    return null;
+  }
+  return state.actions.find((action) => (
+    action.credential.label === label && action.credential.provider === provider
+  ))?.credential ?? null;
+}
+
+function installedCredentialBindingForLabel(label) {
+  if (typeof label !== 'string') {
+    return null;
+  }
+  return state.actions.find((action) => action.credential.label === label)?.credential ?? null;
+}
+
+function actionDisplayName(name) {
+  return name.replaceAll('_', ' ');
 }
 
 function credentialCard(credential) {
@@ -825,10 +909,14 @@ function credentialCard(credential) {
   const revokeDisclosureKey = `credential-${label}-revoke`;
   const technicalOpen = disclosureIsOpen(disclosureKey, false);
   const revokeOpen = disclosureIsOpen(revokeDisclosureKey, false);
+  const binding = installedCredentialBindingForLabel(label);
   const revokeConfirmation = status === 'active'
     ? `<details class="revoke-confirmation" data-disclosure-key="${escapeAttribute(revokeDisclosureKey)}"${revokeOpen ? ' open' : ''}><summary aria-expanded="${revokeOpen}">Revoke capability</summary><form class="danger-zone" data-action="revoke-credential" data-label="${escapeAttribute(label)}"><label for="revoke-${escapeAttribute(cssIdentifier(label))}">Type REVOKE to stop this sealed credential from being used</label><div class="inline-form"><input id="revoke-${escapeAttribute(cssIdentifier(label))}" name="confirmation" autocomplete="off" inputmode="text"><button class="button danger" type="submit">Confirm revocation</button></div></form></details>`
     : '';
-  return `<article class="credential-card"><div class="row-heading"><div><p class="status-line">sealed · ${escapeHtml(status)}</p><h2>${escapeHtml(label)}</h2></div><span class="status-badge">${escapeHtml(status)}</span></div>${revokeConfirmation}<details class="technical" data-disclosure-key="${escapeAttribute(disclosureKey)}"${technicalOpen ? ' open' : ''}><summary aria-expanded="${technicalOpen}">credential details</summary><dl class="facts"><div><dt>storage</dt><dd>sealed local vault</dd></div><div><dt>instance</dt><dd class="mono">${escapeHtml(shortValue(instance))}</dd></div><div><dt>last change</dt><dd>${escapeHtml(formatTime(credential.updatedAt))}</dd></div></dl><form class="danger-zone" data-action="delete-credential" data-label="${escapeAttribute(label)}"><label for="delete-${escapeAttribute(cssIdentifier(label))}">Type DELETE to permanently remove this credential</label><div class="inline-form"><input id="delete-${escapeAttribute(cssIdentifier(label))}" name="confirmation" autocomplete="off" inputmode="text"><button class="button danger" type="submit">Remove sealed credential</button></div></form></details><div class="actions"><button class="button secondary" type="button" data-action="create-deposit">Rotate credential</button></div></article>`;
+  const rotation = binding === null
+    ? ''
+    : `<div class="actions"><button class="button secondary" type="button" data-action="create-deposit" data-label="${escapeAttribute(binding.label)}" data-provider="${escapeAttribute(binding.provider)}">Rotate credential</button></div>`;
+  return `<article class="credential-card"><div class="row-heading"><div><p class="status-line">sealed · ${escapeHtml(status)}</p><h2>${escapeHtml(label)}</h2></div><span class="status-badge">${escapeHtml(status)}</span></div>${revokeConfirmation}<details class="technical" data-disclosure-key="${escapeAttribute(disclosureKey)}"${technicalOpen ? ' open' : ''}><summary aria-expanded="${technicalOpen}">credential details</summary><dl class="facts"><div><dt>storage</dt><dd>sealed local vault</dd></div><div><dt>instance</dt><dd class="mono">${escapeHtml(shortValue(instance))}</dd></div><div><dt>last change</dt><dd>${escapeHtml(formatTime(credential.updatedAt))}</dd></div></dl><form class="danger-zone" data-action="delete-credential" data-label="${escapeAttribute(label)}"><label for="delete-${escapeAttribute(cssIdentifier(label))}">Type DELETE to permanently remove this credential</label><div class="inline-form"><input id="delete-${escapeAttribute(cssIdentifier(label))}" name="confirmation" autocomplete="off" inputmode="text"><button class="button danger" type="submit">Remove sealed credential</button></div></form></details>${rotation}</article>`;
 }
 
 function activityRow(activity) {
@@ -1247,6 +1335,136 @@ class ApiRequestError extends Error {
 
 function arrayValue(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function actionArray(value) {
+  if (!Array.isArray(value) || value.length > 64 || !value.every(isActionProjection)) {
+    throw new Error('Installed action list was unavailable.');
+  }
+  return Object.freeze(value.map(freezeAction));
+}
+
+function isActionProjection(value) {
+  if (!isPlainObject(value)) {
+    return false;
+  }
+  const keys = ['approval', 'credential', 'name', 'params', 'version'];
+  if (Object.keys(value).length !== keys.length || !keys.every((key) => Object.hasOwn(value, key))) {
+    return false;
+  }
+  const approval = ownDataValue(value, 'approval');
+  const credential = ownDataValue(value, 'credential');
+  const name = ownDataValue(value, 'name');
+  const params = ownDataValue(value, 'params');
+  const version = ownDataValue(value, 'version');
+  return approval === 'always'
+    && typeof name === 'string'
+    && /^[a-z][a-z0-9_]{2,127}$/u.test(name)
+    && Number.isInteger(version)
+    && version >= 1
+    && version <= 1_000_000
+    && isCredentialBindingProjection(credential)
+    && isBoundedJsonObject(params);
+}
+
+function isCredentialBindingProjection(value) {
+  if (!isPlainObject(value) || Object.keys(value).length !== 2) {
+    return false;
+  }
+  const label = ownDataValue(value, 'label');
+  const provider = ownDataValue(value, 'provider');
+  return typeof label === 'string'
+    && label.length > 0
+    && label.length <= 128
+    && label === label.trim()
+    && !/[\u0000-\u001f]/u.test(label)
+    && typeof provider === 'string'
+    && /^[a-z0-9][a-z0-9-]{0,63}$/u.test(provider);
+}
+
+function isBoundedJsonObject(value) {
+  return isPlainObject(value) && isBoundedJson(value, { keys: 0 }, 0);
+}
+
+function isBoundedJson(value, state, depth) {
+  if (depth > 8) {
+    return false;
+  }
+  if (value === null || typeof value === 'boolean') {
+    return true;
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value);
+  }
+  if (typeof value === 'string') {
+    return value.length <= 1024;
+  }
+  if (Array.isArray(value)) {
+    return value.length <= 64
+      && Object.getOwnPropertySymbols(value).length === 0
+      && value.every((item, index) => Object.hasOwn(value, index) && isBoundedJson(item, state, depth + 1));
+  }
+  if (!isPlainObject(value) || Object.getOwnPropertySymbols(value).length > 0) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  if (keys.length > 64 || state.keys + keys.length > 64) {
+    return false;
+  }
+  state.keys += keys.length;
+  return keys.every((key) => {
+    const item = ownDataValue(value, key);
+    return key.length > 0
+      && key.length <= 128
+      && !/[\u0000-\u001f]/u.test(key)
+      && item !== undefined
+      && isBoundedJson(item, state, depth + 1);
+  });
+}
+
+function freezeAction(value) {
+  return Object.freeze({
+    approval: value.approval,
+    credential: Object.freeze({
+      label: value.credential.label,
+      provider: value.credential.provider,
+    }),
+    name: value.name,
+    params: freezeJson(value.params),
+    version: value.version,
+  });
+}
+
+function freezeJson(value) {
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map(freezeJson));
+  }
+  const result = Object.create(null);
+  for (const key of Object.keys(value)) {
+    Object.defineProperty(result, key, {
+      configurable: false,
+      enumerable: true,
+      value: freezeJson(value[key]),
+      writable: false,
+    });
+  }
+  return Object.freeze(result);
+}
+
+function ownDataValue(value, key) {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor !== undefined && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+}
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function stringValue(value, fallback) {

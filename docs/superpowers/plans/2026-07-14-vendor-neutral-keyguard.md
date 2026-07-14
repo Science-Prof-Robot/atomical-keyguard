@@ -22,8 +22,8 @@ third-party dependencies.
   launch a provider process.
 - Integrations are reviewed code passed at daemon startup only; HTTP, MCP,
   prompts, repository files, and provider docs cannot add or modify one.
-- Every action binds its immutable name, version, credential label, canonical
-  prepared params, target, Git snapshot, approval, and receipt.
+- Every action binds its immutable name, version, full credential binding,
+  canonical prepared params, target, Git snapshot, approval, and receipt.
 - Preserve the no-secret boundary: no value may reach UI, MCP, logs, activity,
   memory, receipt, or agent context.
 - Preserve loopback-only HTTP, exact approval, one-time handoff, and fixed
@@ -81,7 +81,7 @@ createCloudflarePagesIntegration(options)
 
 ```js
 EnvelopeBody = {
-  action, actionVersion, agent, credentialLabel, params, target,
+  action, actionVersion, agent, credentialLabel, credentialProvider, params, target,
   project, requestedAt, expiresAt, nonce, policyVersion
 }
 ```

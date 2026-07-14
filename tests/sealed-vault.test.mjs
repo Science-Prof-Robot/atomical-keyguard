@@ -57,6 +57,25 @@ test('seals credentials at rest and exposes only a safe projection', async () =>
   });
 });
 
+test('requires an exact sealed credential binding for execution reads', async () => {
+  await withTemporaryDataDirectory(async (dataDirectory) => {
+    const vault = await SealedVault.open({ dataDirectory });
+    await vault.put(
+      { label: 'shared-deploy-token', provider: 'provider-a' },
+      'binding-test-secret',
+    );
+
+    await assert.rejects(
+      vault.readForExecution({ label: 'shared-deploy-token', provider: 'provider-b' }),
+      /Credential is not available for execution\./,
+    );
+    assert.equal(
+      await vault.readForExecution({ label: 'shared-deploy-token', provider: 'provider-a' }),
+      'binding-test-secret',
+    );
+  });
+});
+
 test('creates a new opaque credential instance for a recreated label at the same timestamp', async () => {
   await withTemporaryDataDirectory(async (dataDirectory) => {
     const vault = await SealedVault.open({

@@ -3,6 +3,7 @@ import { win32 } from 'node:path';
 
 export const MAX_REQUEST_BODY_BYTES = 16 * 1024;
 
+const ACTION_NAME_PATTERN = /^[a-z][a-z0-9_]{2,127}$/u;
 const DELETE_CONFIRMATION = 'DELETE';
 const INSTALL_CONFIRMATION = 'INSTALL';
 const REVOKE_CONFIRMATION = 'REVOKE';
@@ -24,6 +25,11 @@ const EXECUTION_STATUSES = new Set([
 const PROVIDER_STATUSES = new Set(['succeeded', 'failed', 'not_started']);
 const VERIFICATION_STATUSES = new Set(['verified', 'failed', 'not_run']);
 const INSTALL_APPLY_STATUSES = new Set(['written', 'updated', 'unchanged', 'mode_repaired']);
+const MAX_ACTION_PARAM_BYTES = 8 * 1024;
+const MAX_ACTION_PARAM_DEPTH = 8;
+const MAX_ACTION_PARAM_KEYS = 64;
+const MAX_ACTION_PARAM_STRING_BYTES = 1024;
+const PROVIDER_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 
 /**
  * Builds the secret-free HTTP API handler. Service output is projected through
@@ -91,6 +97,18 @@ async function dispatch({ app, method, pathname, request, services }) {
   }
   if (method === 'POST' && pathname === '/api/deposit-link') {
     const metadata = depositMetadata(await readJsonObject(request));
+    const registry = requiredActionRegistry(services.actionRegistry, ['getCredentialBinding']);
+    const binding = await invoke(registry, 'getCredentialBinding', metadata);
+    if (binding === undefined) {
+      throw httpError(409, 'not_installed');
+    }
+    const installedBinding = projectCredentialBinding(binding);
+    if (
+      installedBinding.label !== metadata.label
+      || installedBinding.provider !== metadata.provider
+    ) {
+      throw httpError(503, 'service_unavailable');
+    }
     const deposit = await invoke(services.depositService, 'create', metadata);
     return { body: { deposit: projectDeposit(deposit) }, status: 201 };
   }
@@ -108,8 +126,9 @@ async function dispatch({ app, method, pathname, request, services }) {
     return { body: { items: ensureArray(activity).map(projectActivity) }, status: 200 };
   }
   if (method === 'GET' && pathname === '/api/actions') {
-    const actions = await invoke(services.actionRegistry, 'list');
-    return { body: { items: ensureArray(actions).map(projectAction) }, status: 200 };
+    const registry = requiredActionRegistry(services.actionRegistry, ['get', 'list']);
+    const actions = await invoke(registry, 'list');
+    return { body: { items: ensureArray(actions).map((action) => projectAction(action, registry)) }, status: 200 };
   }
   if (method === 'GET' && pathname === '/api/memory') {
     const memory = await invoke(services.memory, 'list');
@@ -325,7 +344,7 @@ async function readJsonObject(request) {
 function depositMetadata(value) {
   assertExactKeys(value, ['label', 'provider']);
   const label = safeLabel(value.label);
-  if (typeof value.provider !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/u.test(value.provider)) {
+  if (typeof value.provider !== 'string' || !PROVIDER_PATTERN.test(value.provider)) {
     throw httpError(400, 'invalid_request');
   }
   return Object.freeze({ label, provider: value.provider });
@@ -809,7 +828,7 @@ function projectApprovalSummary(value) {
   if (!isPlainObject(value)) {
     throw httpError(503, 'service_unavailable');
   }
-  const keys = ['commit', 'dirty', 'repositoryFingerprint', 'targetProject'];
+  const keys = ['commit', 'dirty', 'repositoryFingerprint'];
   assertValueKeys(value, keys);
   if (
     typeof value.commit !== 'string'
@@ -817,8 +836,6 @@ function projectApprovalSummary(value) {
     || typeof value.dirty !== 'boolean'
     || typeof value.repositoryFingerprint !== 'string'
     || !/^[a-f0-9]{64}$/u.test(value.repositoryFingerprint)
-    || typeof value.targetProject !== 'string'
-    || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(value.targetProject)
   ) {
     throw httpError(503, 'service_unavailable');
   }
@@ -826,7 +843,6 @@ function projectApprovalSummary(value) {
     commit: value.commit,
     dirty: value.dirty,
     repositoryFingerprint: value.repositoryFingerprint,
-    targetProject: value.targetProject,
   };
 }
 
@@ -850,24 +866,181 @@ function projectActivity(value) {
   return objectFromKeys(value, keys);
 }
 
-function projectAction(value) {
-  if (!isPlainObject(value) || !isPlainObject(value.params)) {
+function projectAction(value, registry) {
+  if (!isPlainObject(value)) {
     throw httpError(503, 'service_unavailable');
   }
-  assertValueKeys(value.params, ['directory', 'project']);
+  assertValueKeys(value, ['approval', 'name', 'params', 'version']);
+  const { approval, name, params, version } = value;
   if (
-    typeof value.approval !== 'string'
-    || typeof value.name !== 'string'
-    || typeof value.params.directory !== 'string'
-    || typeof value.params.project !== 'string'
+    approval !== 'always'
+    || typeof name !== 'string'
+    || !ACTION_NAME_PATTERN.test(name)
+    || !Number.isInteger(version)
+    || version < 1
+    || version > 1_000_000
+  ) {
+    throw httpError(503, 'service_unavailable');
+  }
+  const action = installedAction(registry, name);
+  if (
+    action === undefined
+    || action.approval !== approval
+    || action.version !== version
   ) {
     throw httpError(503, 'service_unavailable');
   }
   return {
-    approval: value.approval,
-    name: value.name,
-    params: { directory: value.params.directory, project: value.params.project },
+    approval,
+    credential: action.credential,
+    name,
+    params: cloneBoundedJsonObject(params),
+    version,
   };
+}
+
+function requiredActionRegistry(registry, methods) {
+  if (registry === null || typeof registry !== 'object') {
+    throw httpError(503, 'service_unavailable');
+  }
+  for (const method of methods) {
+    if (typeof registry[method] !== 'function') {
+      throw httpError(503, 'service_unavailable');
+    }
+  }
+  return registry;
+}
+
+function installedAction(registry, actionName) {
+  let action;
+  try {
+    action = registry.get(actionName);
+  } catch {
+    throw httpError(503, 'service_unavailable');
+  }
+  if (action === undefined) {
+    return undefined;
+  }
+  if (!isPlainObject(action)) {
+    throw httpError(503, 'service_unavailable');
+  }
+  assertValueKeys(action, ['approval', 'credential', 'credentialLabel', 'name', 'version']);
+  const credential = projectCredentialBinding(action.credential);
+  if (
+    action.approval !== 'always'
+    || action.name !== actionName
+    || !ACTION_NAME_PATTERN.test(action.name)
+    || action.credentialLabel !== credential.label
+    || !Number.isInteger(action.version)
+    || action.version < 1
+    || action.version > 1_000_000
+  ) {
+    throw httpError(503, 'service_unavailable');
+  }
+  return Object.freeze({
+    approval: action.approval,
+    credential,
+    name: action.name,
+    version: action.version,
+  });
+}
+
+function projectCredentialBinding(value) {
+  if (!isPlainObject(value)) {
+    throw httpError(503, 'service_unavailable');
+  }
+  assertValueKeys(value, ['label', 'provider']);
+  if (
+    !validCredentialLabel(value.label)
+    || typeof value.provider !== 'string'
+    || !PROVIDER_PATTERN.test(value.provider)
+  ) {
+    throw httpError(503, 'service_unavailable');
+  }
+  return Object.freeze({ label: value.label, provider: value.provider });
+}
+
+function validCredentialLabel(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 128
+    && value === value.trim()
+    && !/[\u0000-\u001f]/u.test(value);
+}
+
+function cloneBoundedJsonObject(value) {
+  if (!isPlainObject(value)) {
+    throw httpError(503, 'service_unavailable');
+  }
+  const state = { keys: 0 };
+  const cloned = cloneBoundedJson(value, state, 0);
+  const serialized = JSON.stringify(cloned);
+  if (
+    typeof serialized !== 'string'
+    || Buffer.byteLength(serialized, 'utf8') > MAX_ACTION_PARAM_BYTES
+  ) {
+    throw httpError(503, 'service_unavailable');
+  }
+  return cloned;
+}
+
+function cloneBoundedJson(value, state, depth) {
+  if (depth > MAX_ACTION_PARAM_DEPTH) {
+    throw httpError(503, 'service_unavailable');
+  }
+  if (value === null || typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw httpError(503, 'service_unavailable');
+    }
+    return value;
+  }
+  if (typeof value === 'string') {
+    if (Buffer.byteLength(value, 'utf8') > MAX_ACTION_PARAM_STRING_BYTES) {
+      throw httpError(503, 'service_unavailable');
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > MAX_ACTION_PARAM_KEYS || Object.getOwnPropertySymbols(value).length > 0) {
+      throw httpError(503, 'service_unavailable');
+    }
+    const result = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) {
+        throw httpError(503, 'service_unavailable');
+      }
+      result.push(cloneBoundedJson(value[index], state, depth + 1));
+    }
+    return result;
+  }
+  if (!isPlainObject(value) || Object.getOwnPropertySymbols(value).length > 0) {
+    throw httpError(503, 'service_unavailable');
+  }
+  const keys = Object.keys(value);
+  if (keys.length > MAX_ACTION_PARAM_KEYS || state.keys + keys.length > MAX_ACTION_PARAM_KEYS) {
+    throw httpError(503, 'service_unavailable');
+  }
+  state.keys += keys.length;
+  const result = {};
+  for (const key of keys) {
+    if (key.length === 0 || key.length > 128 || /[\u0000-\u001f]/u.test(key)) {
+      throw httpError(503, 'service_unavailable');
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) {
+      throw httpError(503, 'service_unavailable');
+    }
+    Object.defineProperty(result, key, {
+      configurable: false,
+      enumerable: true,
+      value: cloneBoundedJson(descriptor.value, state, depth + 1),
+      writable: false,
+    });
+  }
+  return result;
 }
 
 function projectMemory(value) {
@@ -1116,6 +1289,7 @@ const SAFE_ERRORS = Object.freeze({
   invalid_json: 'Request body must be valid JSON.',
   invalid_request: 'Request is invalid.',
   method_not_allowed: 'This method is not supported for this path.',
+  not_installed: 'This provider or action is not installed in this Keyguard profile.',
   not_found: 'The requested resource was not found.',
   payload_too_large: 'Request body is too large.',
   request_failed: 'Request could not be completed.',

@@ -16,9 +16,9 @@ import test from 'node:test';
 import { sha256 } from '../src/core/canonical.mjs';
 import { LocalIdentity } from '../src/identity/local-identity.mjs';
 import { createKeyguardApp } from '../src/bootstrap.mjs';
-import { ACTION_NAME, createActionRegistry } from '../src/policy/action-registry.mjs';
+import { createActionRegistry } from '../src/policy/action-registry.mjs';
 import { PolicyEngine } from '../src/policy/policy-engine.mjs';
-import { validateActionParams } from '../src/policy/validators.mjs';
+import { CLOUDFLARE_PAGES_ACTION as ACTION_NAME, createCloudflarePagesIntegration } from '../src/providers/cloudflare-pages.mjs';
 import { GitInspector } from '../src/project/git-inspector.mjs';
 import { ApprovalService } from '../src/services/approvals.mjs';
 import { SealedVault } from '../src/storage/sealed-vault.mjs';
@@ -27,14 +27,33 @@ import { withTemporaryDataDirectory } from './helpers.mjs';
 const execFileAsync = promisify(execFile);
 const INITIAL_TIME = '2026-07-14T12:00:00.000Z';
 
-test('registry contains only the fixed Pages deploy action and refuses wildcard roots', async () => {
+test('registry is empty by default and installs an explicit reviewed Pages integration', async () => {
   await withTemporaryRepository(async (repositoryRoot) => {
-    const registry = createActionRegistry({ approvedProjectRoots: [repositoryRoot] });
+    const emptyRegistry = createActionRegistry({ approvedProjectRoots: [repositoryRoot] });
+    const registry = createActionRegistry({
+      approvedProjectRoots: [repositoryRoot],
+      integrations: [createCloudflarePagesIntegration()],
+    });
     const action = registry.get(ACTION_NAME);
 
-    assert.deepEqual(registry.list().map((candidate) => candidate.name), [ACTION_NAME]);
+    assert.deepEqual(emptyRegistry.list(), []);
+    assert.equal(emptyRegistry.get(ACTION_NAME), undefined);
+    assert.deepEqual(registry.list(), [{
+      approval: 'always',
+      name: ACTION_NAME,
+      params: {
+        directory: 'relative_path',
+        project: 'slug',
+      },
+      version: 1,
+    }]);
     assert.equal(action.name, 'cloudflare_pages_deploy');
+    assert.equal(action.version, 1);
     assert.equal(action.credentialLabel, 'cloudflare-api-token');
+    assert.deepEqual(action.credential, {
+      label: 'cloudflare-api-token',
+      provider: 'cloudflare',
+    });
     assert.equal(action.approval, 'always');
     assert.deepEqual(action.params, {
       directory: 'relative_path',
@@ -42,6 +61,64 @@ test('registry contains only the fixed Pages deploy action and refuses wildcard 
     });
     assert.deepEqual(action.approvedProjectRoots, [await realpath(repositoryRoot)]);
     assert.equal(action.approvedProjectRoots.includes('*'), false);
+    assert.deepEqual(registry.getCredentialBinding({
+      label: 'cloudflare-api-token',
+      provider: 'cloudflare',
+    }), {
+      label: 'cloudflare-api-token',
+      provider: 'cloudflare',
+    });
+    assert.equal(registry.getCredentialBinding({
+      label: 'cloudflare-api-token',
+      provider: 'attacker',
+    }), undefined);
+    const sharedCredentialRegistry = createActionRegistry({
+      approvedProjectRoots: [repositoryRoot],
+      integrations: ['example_publish', 'example_preview'].map((name) => ({
+        action: {
+          approval: 'always',
+          credential: { label: 'example-api-token', provider: 'example' },
+          name,
+          params: {},
+          version: 1,
+        },
+        async execute() {
+          return { status: 'succeeded', stderr: '', stdout: '' };
+        },
+        async prepare() {
+          return { params: {}, target: {} };
+        },
+      })),
+    });
+    assert.deepEqual(sharedCredentialRegistry.list().map((item) => item.name), [
+      'example_preview',
+      'example_publish',
+    ]);
+    assert.deepEqual(sharedCredentialRegistry.getCredentialBinding({
+      label: 'example-api-token',
+      provider: 'example',
+    }), {
+      label: 'example-api-token',
+      provider: 'example',
+    });
+    assert.throws(
+      () => createActionRegistry({
+        approvedProjectRoots: [repositoryRoot],
+        integrations: [
+          reviewedIntegration('example_publish', { label: 'shared-token', provider: 'example' }),
+          reviewedIntegration('other_publish', { label: 'shared-token', provider: 'other' }),
+        ],
+      }),
+      /credential label.*multiple providers/i,
+    );
+    assert.doesNotMatch(JSON.stringify(registry.list()), /executable|wrangler|argv/u);
+    assert.throws(
+      () => createActionRegistry({
+        approvedProjectRoots: [repositoryRoot],
+        integrations: [createCloudflarePagesIntegration(), createCloudflarePagesIntegration()],
+      }),
+      /duplicate.*action|duplicate.*credential/i,
+    );
     assert.throws(
       () => createActionRegistry({ approvedProjectRoots: ['*'] }),
       /approved project root/i,
@@ -52,42 +129,70 @@ test('registry contains only the fixed Pages deploy action and refuses wildcard 
   });
 });
 
-test('validates only existing contained deployment directories and a strict project slug', async () => {
+function reviewedIntegration(name, credential) {
+  return {
+    action: {
+      approval: 'always',
+      credential,
+      name,
+      params: {},
+      version: 1,
+    },
+    async execute() {
+      return { status: 'succeeded', stderr: '', stdout: '' };
+    },
+    async prepare() {
+      return { params: {}, target: {} };
+    },
+  };
+}
+
+test('the explicit Pages integration validates only existing contained deployment directories and a strict project slug', async () => {
   await withTemporaryRepository(async (repositoryRoot) => {
     const outsideDirectory = await mkdtemp(join(tmpdir(), 'atomical-keyguard-outside-'));
     const escapePath = join(repositoryRoot, 'escape');
+    const registry = createActionRegistry({
+      approvedProjectRoots: [repositoryRoot],
+      integrations: [createCloudflarePagesIntegration()],
+    });
+    const snapshot = { root: await realpath(repositoryRoot) };
 
     try {
       await symlink(outsideDirectory, escapePath);
-      const validated = await validateActionParams(
+      const validated = await registry.prepare(
         ACTION_NAME,
         { directory: 'dist', project: 'keyguard-site' },
-        repositoryRoot,
+        snapshot,
       );
 
       assert.deepEqual(validated, {
-        directory: 'dist',
-        directoryPath: await realpath(join(repositoryRoot, 'dist')),
-        project: 'keyguard-site',
+        params: {
+          directory: 'dist',
+          project: 'keyguard-site',
+        },
+        target: {
+          directory: await realpath(join(repositoryRoot, 'dist')),
+          project: 'keyguard-site',
+        },
       });
       await assert.rejects(
-        validateActionParams(ACTION_NAME, { directory: '../../secret', project: 'keyguard-site' }, repositoryRoot),
+        registry.prepare(ACTION_NAME, { directory: '../../secret', project: 'keyguard-site' }, snapshot),
         /relative path/i,
       );
       await assert.rejects(
-        validateActionParams(ACTION_NAME, { directory: '/tmp', project: 'keyguard-site' }, repositoryRoot),
+        registry.prepare(ACTION_NAME, { directory: '/tmp', project: 'keyguard-site' }, snapshot),
         /relative path/i,
       );
       await assert.rejects(
-        validateActionParams(ACTION_NAME, { directory: 'escape', project: 'keyguard-site' }, repositoryRoot),
+        registry.prepare(ACTION_NAME, { directory: 'escape', project: 'keyguard-site' }, snapshot),
         /inside the project root/i,
       );
       await assert.rejects(
-        validateActionParams(ACTION_NAME, { directory: 'missing', project: 'keyguard-site' }, repositoryRoot),
+        registry.prepare(ACTION_NAME, { directory: 'missing', project: 'keyguard-site' }, snapshot),
         /does not exist/i,
       );
       await assert.rejects(
-        validateActionParams(ACTION_NAME, { directory: 'dist', project: 'Bad Project' }, repositoryRoot),
+        registry.prepare(ACTION_NAME, { directory: 'dist', project: 'Bad Project' }, snapshot),
         /slug/i,
       );
     } finally {
@@ -96,8 +201,28 @@ test('validates only existing contained deployment directories and a strict proj
   });
 });
 
-test('denies unknown actions before any policy request can become executable', async () => {
-  await withPolicySystem(async ({ engine, repositoryRoot }) => {
+test('denies unknown actions before Git or vault work', async () => {
+  await withPolicySystem(async ({ approvals, clock, identity, repositoryRoot }) => {
+    let gitInspections = 0;
+    let vaultReads = 0;
+    const engine = new PolicyEngine({
+      approvalService: approvals,
+      clock,
+      gitInspector: {
+        async inspect() {
+          gitInspections += 1;
+          throw new Error('must not inspect an unknown action');
+        },
+      },
+      identity,
+      registry: createActionRegistry({ approvedProjectRoots: [repositoryRoot] }),
+      vault: {
+        async list() {
+          vaultReads += 1;
+          throw new Error('must not read the vault for an unknown action');
+        },
+      },
+    });
     const decision = await engine.evaluate(requestFor(repositoryRoot, {
       action: 'run_arbitrary_shell',
       executable: 'sh',
@@ -106,6 +231,71 @@ test('denies unknown actions before any policy request can become executable', a
 
     assert.equal(decision.status, 'denied');
     assert.equal(decision.code, 'unknown_action');
+    assert.equal(gitInspections, 0);
+    assert.equal(vaultReads, 0);
+  });
+});
+
+test('accepts a trusted non-Cloudflare integration supplied at startup and delegates preparation', async () => {
+  await withPolicySystem(async ({ approvals, clock, identity, repositoryRoot, vault }) => {
+    const preparationCalls = [];
+    const executionCalls = [];
+    const integration = {
+      action: {
+        approval: 'always',
+        credential: { label: 'example-api-token', provider: 'example' },
+        name: 'example_publish',
+        params: { site: 'slug' },
+        version: 7,
+      },
+      async execute({ envelope, secret }) {
+        executionCalls.push({ envelope, secret });
+        return { exitCode: 0, status: 'succeeded', stderr: '', stdout: '' };
+      },
+      async prepare({ params, projectRoot, snapshot }) {
+        preparationCalls.push({ params, projectRoot, snapshot });
+        if (params?.site !== 'keyguard-site') {
+          throw new Error('site must be a slug');
+        }
+        return {
+          params: { site: params.site },
+          target: { projectRoot, site: params.site },
+        };
+      },
+    };
+    const registry = createActionRegistry({
+      approvedProjectRoots: [repositoryRoot],
+      integrations: [integration],
+    });
+    const engine = new PolicyEngine({
+      approvalService: approvals,
+      clock,
+      gitInspector: new GitInspector(),
+      identity,
+      registry,
+      vault,
+    });
+
+    const decision = await engine.evaluate({
+      action: 'example_publish',
+      agentId: 'codex-test-agent',
+      params: { site: 'keyguard-site' },
+      projectRoot: repositoryRoot,
+    });
+
+    assert.deepEqual(registry.list(), [{
+      approval: 'always',
+      name: 'example_publish',
+      params: { site: 'slug' },
+      version: 7,
+    }]);
+    assert.equal(decision.status, 'credential_needed');
+    assert.equal(decision.credentialLabel, 'example-api-token');
+    assert.equal(preparationCalls.length, 1);
+    assert.equal(preparationCalls[0].projectRoot, await realpath(repositoryRoot));
+    await registry.execute({ action: 'example_publish' }, 'test-only-secret');
+    assert.equal(executionCalls.length, 1);
+    assert.equal(executionCalls[0].secret, 'test-only-secret');
   });
 });
 
@@ -127,9 +317,35 @@ test('returns credential_needed for missing and revoked fixed credentials', asyn
   });
 });
 
+test('requires an exact credential provider binding before creating an approval', async () => {
+  await withPolicySystem(async ({ engine, repositoryRoot, vault }) => {
+    await vault.put(
+      { label: 'cloudflare-api-token', provider: 'different-provider' },
+      'wrong-provider-test-secret',
+    );
+
+    const mismatched = await engine.evaluate(requestFor(repositoryRoot));
+
+    assert.equal(mismatched.status, 'credential_needed');
+    assert.equal(mismatched.credentialLabel, 'cloudflare-api-token');
+
+    await vault.delete('cloudflare-api-token');
+    await vault.put(
+      { label: 'cloudflare-api-token', provider: 'cloudflare' },
+      'matching-provider-test-secret',
+    );
+
+    const matched = await engine.evaluate(requestFor(repositoryRoot));
+    assert.equal(matched.status, 'approval_required');
+  });
+});
+
 test('builds a signed canonical envelope from daemon-derived state and ignores caller execution fields', async () => {
   await withPolicySystem(async ({ clock, engine, identity, repositoryRoot, vault }) => {
-    await vault.put({ label: 'cloudflare-api-token' }, 'test-only-deploy-secret');
+    await vault.put(
+      { label: 'cloudflare-api-token', provider: 'cloudflare' },
+      'test-only-deploy-secret',
+    );
     const actualCommit = await git(repositoryRoot, ['rev-parse', 'HEAD']);
     const maliciousCommit = '0000000000000000000000000000000000000000';
     const request = requestFor(repositoryRoot, {
@@ -152,6 +368,7 @@ test('builds a signed canonical envelope from daemon-derived state and ignores c
     assert.equal(first.envelope.body.target.directory, await realpath(join(repositoryRoot, 'dist')));
     assert.equal(first.envelope.body.target.project, 'keyguard-site');
     assert.equal(first.envelope.body.credentialLabel, 'cloudflare-api-token');
+    assert.equal(first.envelope.body.credentialProvider, 'cloudflare');
     assert.equal(first.envelope.bodyHash, sha256(first.envelope.body));
     assert.notEqual(first.envelope.body.nonce, second.envelope.body.nonce);
     assert.equal(identity.verifyCanonical(first.envelope.body, first.envelope.signature), true);
@@ -172,6 +389,7 @@ test('bootstrap composes the daemon-owned policy and approval services', async (
     const app = await createKeyguardApp({
       approvedProjectRoots: [process.cwd()],
       dataDirectory,
+      integrations: [createCloudflarePagesIntegration()],
     });
 
     assert.equal(typeof app.services.actionRegistry.get, 'function');
@@ -195,7 +413,10 @@ async function withPolicySystem(run) {
         identity,
         vault,
       });
-      const registry = createActionRegistry({ approvedProjectRoots: [repositoryRoot] });
+      const registry = createActionRegistry({
+        approvedProjectRoots: [repositoryRoot],
+        integrations: [createCloudflarePagesIntegration()],
+      });
       const engine = new PolicyEngine({
         approvalService: approvals,
         clock,

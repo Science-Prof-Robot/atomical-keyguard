@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { LocalIdentity } from '../src/identity/local-identity.mjs';
-import { ACTION_NAME } from '../src/policy/action-registry.mjs';
+import { CLOUDFLARE_PAGES_ACTION as ACTION_NAME } from '../src/providers/cloudflare-pages.mjs';
 import { ActivityService } from '../src/services/activity.mjs';
 import { MemoryService } from '../src/services/memory.mjs';
 import { withTemporaryDataDirectory } from './helpers.mjs';
@@ -30,7 +30,7 @@ test('memory accepts only a signed verified receipt and requires explicit Save o
     assert.equal(candidate.sourceSignerFingerprint, identity.fingerprint);
     assert.equal(
       candidate.text,
-      'Verified Cloudflare Pages deployment for keyguard-site at aaaaaaaaaaaa.',
+      'Verified cloudflare_pages_deploy action at aaaaaaaaaaaa.',
     );
     assert.equal(identity.verifyCanonical(memoryBody(candidate), candidate.signature), true);
 

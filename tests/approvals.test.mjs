@@ -7,8 +7,9 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { LocalIdentity } from '../src/identity/local-identity.mjs';
-import { ACTION_NAME, createActionRegistry } from '../src/policy/action-registry.mjs';
+import { createActionRegistry } from '../src/policy/action-registry.mjs';
 import { PolicyEngine } from '../src/policy/policy-engine.mjs';
+import { CLOUDFLARE_PAGES_ACTION as ACTION_NAME, createCloudflarePagesIntegration } from '../src/providers/cloudflare-pages.mjs';
 import { GitInspector } from '../src/project/git-inspector.mjs';
 import { ApprovalService } from '../src/services/approvals.mjs';
 import { SealedVault } from '../src/storage/sealed-vault.mjs';
@@ -57,7 +58,6 @@ test('lists only a compact secret-free approval summary for the local control UI
         commit: decision.envelope.body.project.commit,
         dirty: false,
         repositoryFingerprint: decision.envelope.body.project.repositoryFingerprint,
-        targetProject: 'keyguard-site',
       },
       requiresDirtyTreeAcknowledgement: false,
       status: 'pending',
@@ -146,6 +146,52 @@ test('does not revive an approved request when a revoked credential label is rec
     );
     assert.equal(consumed.status, 'invalidated');
     assert.equal(consumed.reason, 'credential_changed');
+  });
+});
+
+test('invalidates an approved request when a reviewed action changes its credential provider', async () => {
+  await withApprovalSystem(async ({
+    approvals,
+    clock,
+    dataDirectory,
+    engine,
+    identity,
+    repositoryRoot,
+    vault,
+  }) => {
+    await activateCredential(vault);
+    const decision = await engine.evaluate(requestFor(repositoryRoot));
+    await approvals.approveOnce(decision.requestId);
+
+    const referenceIntegration = createCloudflarePagesIntegration();
+    const changedRegistry = createActionRegistry({
+      approvedProjectRoots: [repositoryRoot],
+      integrations: [{
+        ...referenceIntegration,
+        action: {
+          ...referenceIntegration.action,
+          credential: {
+            label: 'cloudflare-api-token',
+            provider: 'different-provider',
+          },
+        },
+      }],
+    });
+    const reopened = await ApprovalService.open({
+      actionRegistry: changedRegistry,
+      clock,
+      dataDirectory,
+      identity,
+      vault,
+    });
+
+    const consumed = await reopened.consume(
+      decision.requestId,
+      decision.envelope.body.project.commit,
+    );
+
+    assert.equal(consumed.status, 'invalidated');
+    assert.equal(consumed.reason, 'action_unavailable');
   });
 });
 
@@ -478,7 +524,12 @@ async function withApprovalSystem(run) {
         LocalIdentity.open({ dataDirectory }),
         SealedVault.open({ clock, dataDirectory }),
       ]);
+      const registry = createActionRegistry({
+        approvedProjectRoots: [repositoryRoot],
+        integrations: [createCloudflarePagesIntegration()],
+      });
       const approvals = await ApprovalService.open({
+        actionRegistry: registry,
         clock,
         dataDirectory,
         identity,
@@ -489,7 +540,7 @@ async function withApprovalSystem(run) {
         clock,
         gitInspector: new GitInspector(),
         identity,
-        registry: createActionRegistry({ approvedProjectRoots: [repositoryRoot] }),
+        registry,
         vault,
       });
 

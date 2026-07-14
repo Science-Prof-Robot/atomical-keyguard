@@ -1,9 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, realpath, stat } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 
 import { canonicalJson, sha256 } from '../core/canonical.mjs';
-import { POLICY_VERSION, ACTION_NAME } from '../policy/action-registry.mjs';
+import { POLICY_VERSION } from '../policy/action-registry.mjs';
 import { GitInspector } from '../project/git-inspector.mjs';
 import { JsonStore } from '../storage/json-store.mjs';
 import { defaultDataDirectory } from '../storage/sealed-vault.mjs';
@@ -11,6 +10,7 @@ import { defaultDataDirectory } from '../storage/sealed-vault.mjs';
 const STORE_VERSION = 1;
 const MAX_APPROVAL_TTL_MILLISECONDS = 10 * 60 * 1000;
 const DEFAULT_SCOPE_TTL_MILLISECONDS = 5 * 60 * 1000;
+const MAX_ACTION_DATA_LENGTH = 32 * 1024;
 const RECORD_STATUSES = new Set([
   'pending',
   'approved_once',
@@ -27,6 +27,7 @@ const RECORD_STATUSES = new Set([
  * commit as authoritative: consume re-inspects the stored worktree itself.
  */
 export class ApprovalService {
+  #actionRegistry;
   #clock;
   #credentialVerifier;
   #gitInspector;
@@ -48,6 +49,18 @@ export class ApprovalService {
       throw new TypeError('dataDirectory must be a non-empty string.');
     }
     this.#storagePath = resolve(options.storagePath ?? join(dataDirectory, 'approvals.json'));
+    this.#actionRegistry = options.actionRegistry;
+    if (
+      this.#actionRegistry !== undefined
+      && (
+        this.#actionRegistry === null
+        || typeof this.#actionRegistry !== 'object'
+        || typeof this.#actionRegistry.get !== 'function'
+        || typeof this.#actionRegistry.prepare !== 'function'
+      )
+    ) {
+      throw new TypeError('actionRegistry must provide get and prepare methods.');
+    }
     this.#clock = options.clock ?? { now: () => new Date() };
     if (typeof this.#clock.now !== 'function') {
       throw new TypeError('clock.now must be a function.');
@@ -110,8 +123,12 @@ export class ApprovalService {
     await this.#ready;
     const now = this.#timestamp();
     const normalizedEnvelope = normalizeEnvelope(envelope, this.#identity, now);
+    if (!this.#isRegisteredAction(normalizedEnvelope.body)) {
+      throw approvalUnavailable();
+    }
     const credentialRevision = await this.#credentialRevision(
       normalizedEnvelope.body.credentialLabel,
+      normalizedEnvelope.body.credentialProvider,
     );
     if (credentialRevision === undefined) {
       throw approvalUnavailable();
@@ -319,6 +336,11 @@ export class ApprovalService {
         result = invalidated(record, 'dirty_tree_acknowledgement_required');
         return state;
       }
+      if (!this.#isRegisteredAction(record.envelope.body)) {
+        invalidate(state, record, 'action_unavailable', now);
+        result = invalidated(record, 'action_unavailable');
+        return state;
+      }
 
       let currentSnapshot;
       try {
@@ -334,7 +356,15 @@ export class ApprovalService {
         result = invalidated(record, changedReason);
         return state;
       }
-      const credentialRevision = await this.#credentialRevision(record.envelope.body.credentialLabel);
+      if (!(await this.#targetStillMatches(record.envelope.body, currentSnapshot))) {
+        invalidate(state, record, 'target_changed', now);
+        result = invalidated(record, 'target_changed');
+        return state;
+      }
+      const credentialRevision = await this.#credentialRevision(
+        record.envelope.body.credentialLabel,
+        record.envelope.body.credentialProvider,
+      );
       if (credentialRevision === undefined) {
         invalidate(state, record, 'credential_unavailable', now);
         result = invalidated(record, 'credential_unavailable');
@@ -345,16 +375,6 @@ export class ApprovalService {
         result = invalidated(record, 'credential_changed');
         return state;
       }
-      const targetReason = await targetChangeReason(
-        record.envelope.body.project.root,
-        record.envelope.body.target.directory,
-      );
-      if (targetReason !== undefined) {
-        invalidate(state, record, targetReason, now);
-        result = invalidated(record, targetReason);
-        return state;
-      }
-
       record.consumedAt = now;
       record.status = 'consumed';
       record.updatedAt = now;
@@ -369,19 +389,43 @@ export class ApprovalService {
     return result;
   }
 
-  async #credentialRevision(label) {
+  async #credentialRevision(label, provider) {
     try {
       if (this.#credentialVerifier !== undefined) {
-        return (await this.#credentialVerifier(label)) === true
-          ? sha256({ kind: 'credential-verifier', label })
+        return (await this.#credentialVerifier({ label, provider })) === true
+          ? sha256({ kind: 'credential-verifier', label, provider: provider ?? null })
           : undefined;
       }
-      if (this.#vault === null || typeof this.#vault !== 'object' || typeof this.#vault.list !== 'function') {
+      if (this.#vault === null || typeof this.#vault !== 'object') {
+        return undefined;
+      }
+      if (provider !== undefined && typeof this.#vault.getActiveCredentialBinding === 'function') {
+        const credential = await this.#vault.getActiveCredentialBinding({ label, provider });
+        if (
+          credential === undefined
+          || credential.label !== label
+          || credential.provider !== provider
+          || typeof credential.instanceId !== 'string'
+          || !/^[A-Za-z0-9_-]{32}$/u.test(credential.instanceId)
+        ) {
+          return undefined;
+        }
+        return sha256({
+          instanceId: credential.instanceId,
+          label,
+          provider,
+        });
+      }
+      if (typeof this.#vault.list !== 'function') {
         return undefined;
       }
       const credentials = await this.#vault.list();
       const credential = Array.isArray(credentials)
-        ? credentials.find((candidate) => candidate?.label === label && candidate?.status === 'active')
+        ? credentials.find((candidate) => (
+          candidate?.label === label
+          && candidate?.provider === provider
+          && candidate?.status === 'active'
+        ))
         : undefined;
       if (
         credential === undefined
@@ -393,9 +437,38 @@ export class ApprovalService {
       return sha256({
         instanceId: credential.instanceId,
         label,
+        provider: provider ?? null,
       });
     } catch {
       return undefined;
+    }
+  }
+
+  #isRegisteredAction(body) {
+    if (this.#actionRegistry === undefined) {
+      return true;
+    }
+    try {
+      const action = this.#actionRegistry.get(body.action);
+      return action !== undefined
+        && action.version === body.actionVersion
+        && action.credentialLabel === body.credentialLabel
+        && action.credential?.provider === body.credentialProvider;
+    } catch {
+      return false;
+    }
+  }
+
+  async #targetStillMatches(body, snapshot) {
+    if (this.#actionRegistry === undefined || typeof this.#actionRegistry.prepare !== 'function') {
+      return true;
+    }
+    try {
+      const prepared = await this.#actionRegistry.prepare(body.action, body.params, snapshot);
+      return sameCanonicalValue(prepared.params, body.params)
+        && sameCanonicalValue(prepared.target, body.target);
+    } catch {
+      return false;
     }
   }
 
@@ -594,7 +667,32 @@ function validateBody(body, identity) {
   if (!isPlainObject(body)) {
     throw invalidEnvelope();
   }
-  assertExactKeys(body, [
+  assertBodyKeys(body);
+  if (
+    !validActionName(body.action)
+    || !validCredentialLabel(body.credentialLabel)
+    || body.policyVersion !== POLICY_VERSION
+    || typeof body.nonce !== 'string'
+    || !/^[A-Za-z0-9_-]{16,128}$/u.test(body.nonce)
+  ) {
+    throw invalidEnvelope();
+  }
+  if (Object.hasOwn(body, 'actionVersion') && !validActionVersion(body.actionVersion)) {
+    throw invalidEnvelope();
+  }
+  if (Object.hasOwn(body, 'credentialProvider') && !validCredentialProvider(body.credentialProvider)) {
+    throw invalidEnvelope();
+  }
+  validateAgent(body.agent, identity);
+  validateActionData(body.params);
+  validateProjectSnapshot(body.project);
+  validateActionData(body.target);
+  timestampMilliseconds(body.requestedAt, invalidEnvelope);
+  timestampMilliseconds(body.expiresAt, invalidEnvelope);
+}
+
+function assertBodyKeys(body) {
+  const legacyKeys = [
     'action',
     'agent',
     'credentialLabel',
@@ -605,22 +703,13 @@ function validateBody(body, identity) {
     'project',
     'requestedAt',
     'target',
-  ], invalidEnvelope);
-  if (
-    body.action !== ACTION_NAME
-    || body.credentialLabel !== 'cloudflare-api-token'
-    || body.policyVersion !== POLICY_VERSION
-    || typeof body.nonce !== 'string'
-    || !/^[A-Za-z0-9_-]{16,128}$/u.test(body.nonce)
-  ) {
-    throw invalidEnvelope();
-  }
-  validateAgent(body.agent, identity);
-  validateParams(body.params);
-  validateProjectSnapshot(body.project);
-  validateTarget(body.target, body.params);
-  timestampMilliseconds(body.requestedAt, invalidEnvelope);
-  timestampMilliseconds(body.expiresAt, invalidEnvelope);
+  ];
+  const keys = [
+    ...legacyKeys,
+    ...(Object.hasOwn(body, 'actionVersion') ? ['actionVersion'] : []),
+    ...(Object.hasOwn(body, 'credentialProvider') ? ['credentialProvider'] : []),
+  ];
+  assertExactKeys(body, keys, invalidEnvelope);
 }
 
 function validateAgent(agent, identity) {
@@ -632,21 +721,6 @@ function validateAgent(agent, identity) {
     typeof agent.id !== 'string'
     || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(agent.id)
     || agent.identity !== identity.fingerprint
-  ) {
-    throw invalidEnvelope();
-  }
-}
-
-function validateParams(params) {
-  if (!isPlainObject(params)) {
-    throw invalidEnvelope();
-  }
-  assertExactKeys(params, ['directory', 'project'], invalidEnvelope);
-  if (
-    typeof params.directory !== 'string'
-    || params.directory.length === 0
-    || typeof params.project !== 'string'
-    || params.project.length === 0
   ) {
     throw invalidEnvelope();
   }
@@ -672,21 +746,6 @@ function validateProjectSnapshot(project) {
   }
 }
 
-function validateTarget(target, params) {
-  if (!isPlainObject(target)) {
-    throw invalidEnvelope();
-  }
-  assertExactKeys(target, ['directory', 'project'], invalidEnvelope);
-  if (
-    typeof target.directory !== 'string'
-    || !isAbsolute(target.directory)
-    || typeof target.project !== 'string'
-    || target.project !== params.project
-  ) {
-    throw invalidEnvelope();
-  }
-}
-
 function validateSignature(signature, identity) {
   if (!isPlainObject(signature)) {
     throw invalidEnvelope();
@@ -703,7 +762,7 @@ function validateSignature(signature, identity) {
 }
 
 function scopeForBody(body, expiresAt, credentialRevision) {
-  return {
+  const scope = {
     action: body.action,
     commit: body.project.commit,
     credentialLabel: body.credentialLabel,
@@ -711,18 +770,22 @@ function scopeForBody(body, expiresAt, credentialRevision) {
     expiresAt,
     repositoryFingerprint: body.project.repositoryFingerprint,
     root: body.project.root,
-    target: {
-      directory: body.target.directory,
-      project: body.target.project,
-    },
+    target: cloneJson(body.target),
   };
+  if (Object.hasOwn(body, 'actionVersion')) {
+    scope.actionVersion = body.actionVersion;
+  }
+  if (Object.hasOwn(body, 'credentialProvider')) {
+    scope.credentialProvider = body.credentialProvider;
+  }
+  return scope;
 }
 
 function validateScope(scope, failure) {
   if (!isPlainObject(scope)) {
     throw failure();
   }
-  assertExactKeys(scope, [
+  const legacyKeys = [
     'action',
     'commit',
     'credentialLabel',
@@ -731,10 +794,16 @@ function validateScope(scope, failure) {
     'repositoryFingerprint',
     'root',
     'target',
-  ], failure);
+  ];
+  const keys = [
+    ...legacyKeys,
+    ...(Object.hasOwn(scope, 'actionVersion') ? ['actionVersion'] : []),
+    ...(Object.hasOwn(scope, 'credentialProvider') ? ['credentialProvider'] : []),
+  ];
+  assertExactKeys(scope, keys, failure);
   if (
-    scope.action !== ACTION_NAME
-    || scope.credentialLabel !== 'cloudflare-api-token'
+    !validActionName(scope.action)
+    || !validCredentialLabel(scope.credentialLabel)
     || typeof scope.credentialRevision !== 'string'
     || !/^[a-f0-9]{64}$/u.test(scope.credentialRevision)
     || typeof scope.commit !== 'string'
@@ -746,19 +815,14 @@ function validateScope(scope, failure) {
   ) {
     throw failure();
   }
+  if (Object.hasOwn(scope, 'actionVersion') && !validActionVersion(scope.actionVersion)) {
+    throw failure();
+  }
+  if (Object.hasOwn(scope, 'credentialProvider') && !validCredentialProvider(scope.credentialProvider)) {
+    throw failure();
+  }
   timestampMilliseconds(scope.expiresAt, failure);
-  if (!isPlainObject(scope.target)) {
-    throw failure();
-  }
-  assertExactKeys(scope.target, ['directory', 'project'], failure);
-  if (
-    typeof scope.target.directory !== 'string'
-    || !isAbsolute(scope.target.directory)
-    || typeof scope.target.project !== 'string'
-    || scope.target.project.length === 0
-  ) {
-    throw failure();
-  }
+  validateActionData(scope.target, failure);
 }
 
 function findMatchingScope(scopes, body, credentialRevision, now) {
@@ -769,12 +833,13 @@ function findMatchingScope(scopes, body, credentialRevision, now) {
     const scope = scopeRecord.scope;
     return (
       scope.action === body.action
+      && scope.actionVersion === body.actionVersion
       && scope.credentialLabel === body.credentialLabel
+      && scope.credentialProvider === body.credentialProvider
       && scope.credentialRevision === credentialRevision
       && scope.repositoryFingerprint === body.project.repositoryFingerprint
       && scope.root === body.project.root
-      && scope.target.directory === body.target.directory
-      && scope.target.project === body.target.project
+      && sameCanonicalValue(scope.target, body.target)
       && scope.commit === body.project.commit
     );
   });
@@ -858,43 +923,6 @@ function revokeScopesForOrigin(state, record, now) {
   record.scopeId = null;
 }
 
-async function targetChangeReason(canonicalRoot, signedTarget) {
-  try {
-    const resolvedRoot = await realpath(canonicalRoot);
-    if (resolvedRoot !== canonicalRoot) {
-      return 'target_changed';
-    }
-    const rootDetails = await lstat(canonicalRoot);
-    if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) {
-      return 'target_changed';
-    }
-
-    const resolvedTarget = await realpath(signedTarget);
-    if (
-      resolvedTarget !== signedTarget
-      || !isContained(canonicalRoot, resolvedTarget)
-      || !(await stat(resolvedTarget)).isDirectory()
-    ) {
-      return 'target_changed';
-    }
-    const targetDetails = await lstat(signedTarget);
-    return !targetDetails.isDirectory() || targetDetails.isSymbolicLink()
-      ? 'target_changed'
-      : undefined;
-  } catch {
-    return 'target_changed';
-  }
-}
-
-function isContained(root, candidate) {
-  const fromRoot = relative(root, candidate);
-  return fromRoot !== ''
-    && fromRoot !== '..'
-    && !fromRoot.startsWith(`..${String.fromCharCode(47)}`)
-    && !fromRoot.startsWith(`..${String.fromCharCode(92)}`)
-    && !isAbsolute(fromRoot);
-}
-
 function project(record) {
   const body = record.envelope.body;
   const projection = {
@@ -932,7 +960,6 @@ function projectForControlUi(record) {
       commit: body.project.commit,
       dirty: body.project.dirty,
       repositoryFingerprint: body.project.repositoryFingerprint,
-      targetProject: body.target.project,
     },
     requiresDirtyTreeAcknowledgement: body.project.dirty && !record.dirtyTreeAcknowledged,
     status: record.status,
@@ -979,6 +1006,39 @@ function sameCanonicalValue(left, right) {
   } catch {
     return false;
   }
+}
+
+function validateActionData(value, failure = invalidEnvelope) {
+  if (!isPlainObject(value)) {
+    throw failure();
+  }
+  try {
+    if (canonicalJson(value).length > MAX_ACTION_DATA_LENGTH) {
+      throw new Error('Action data is too large.');
+    }
+  } catch {
+    throw failure();
+  }
+}
+
+function validActionName(value) {
+  return typeof value === 'string' && /^[a-z][a-z0-9_]{2,127}$/u.test(value);
+}
+
+function validActionVersion(value) {
+  return Number.isInteger(value) && value >= 1 && value <= 1_000_000;
+}
+
+function validCredentialLabel(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 128
+    && value === value.trim()
+    && !/[\u0000-\u001f]/u.test(value);
+}
+
+function validCredentialProvider(value) {
+  return typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/u.test(value);
 }
 
 function cloneCanonical(value, failure) {

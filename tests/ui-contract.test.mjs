@@ -45,6 +45,20 @@ test('documents guided setup and the ordered accessible Home without secret affo
   assert.doesNotMatch(uiText, /type\s*=\s*["']password["']/u);
 });
 
+test('renders installed integrations from the registry and has no default provider handoff', async () => {
+  const { app } = await readUiAssets();
+
+  assert.match(app, /actions:\s*\[\]/u);
+  assert.match(app, /requestApi\('\/api\/actions'\)/u);
+  assert.match(app, /No integrations enabled/u);
+  assert.match(app, /function integrationCard/u);
+  assert.match(app, /data-label="\$\{escapeAttribute\(credential\.label\)\}"/u);
+  assert.match(app, /data-provider="\$\{escapeAttribute\(credential\.provider\)\}"/u);
+  assert.doesNotMatch(app, /cloudflare-api-token/iu);
+  assert.doesNotMatch(app, /provider:\s*'cloudflare'/iu);
+  assert.doesNotMatch(app, /body:\s*\{\s*label:\s*'[^']+'/u);
+});
+
 test('keeps a deposit handoff in ephemeral state and protects every UI mutation with local CSRF state', async () => {
   const { app } = await readUiAssets();
 

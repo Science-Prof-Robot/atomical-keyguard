@@ -8,9 +8,9 @@ import test from 'node:test';
 
 import { createKeyguardApp } from '../src/bootstrap.mjs';
 import { LocalIdentity } from '../src/identity/local-identity.mjs';
-import { ACTION_NAME, createActionRegistry } from '../src/policy/action-registry.mjs';
+import { createActionRegistry } from '../src/policy/action-registry.mjs';
 import { PolicyEngine } from '../src/policy/policy-engine.mjs';
-import { CloudflarePagesAdapter } from '../src/providers/cloudflare-pages.mjs';
+import { CLOUDFLARE_PAGES_ACTION as ACTION_NAME, CloudflarePagesAdapter, createCloudflarePagesIntegration } from '../src/providers/cloudflare-pages.mjs';
 import { GitInspector } from '../src/project/git-inspector.mjs';
 import { ActivityService } from '../src/services/activity.mjs';
 import { ApprovalService } from '../src/services/approvals.mjs';
@@ -108,6 +108,107 @@ test('Cloudflare Pages adapter revalidates a real target directory before runner
   } finally {
     await rm(temporaryProjectRoot, { force: true, recursive: true });
   }
+});
+
+test('executes an explicitly installed non-Cloudflare integration through the same sealed approval path', async () => {
+  await withTemporaryDataDirectory(async (dataDirectory) => {
+    await withTemporaryRepository(async (repositoryRoot) => {
+      const clock = controllableClock(INITIAL_TIME);
+      const [identity, vault] = await Promise.all([
+        LocalIdentity.open({ dataDirectory }),
+        SealedVault.open({ clock, dataDirectory }),
+      ]);
+      const calls = [];
+      const integration = {
+        action: {
+          approval: 'always',
+          credential: { label: 'example-api-token', provider: 'example' },
+          name: 'example_publish',
+          params: { site: 'slug' },
+          version: 7,
+        },
+        async execute({ envelope, secret }) {
+          calls.push({ envelope, secret });
+          return { status: 'succeeded', stderr: '', stdout: 'published' };
+        },
+        async prepare({ params, projectRoot }) {
+          if (params?.site !== 'docs') {
+            throw new Error('site is invalid');
+          }
+          return {
+            params: { site: 'docs' },
+            target: { projectRoot, site: 'docs' },
+          };
+        },
+      };
+      const actionRegistry = createActionRegistry({
+        approvedProjectRoots: [repositoryRoot],
+        integrations: [integration],
+      });
+      const gitInspector = new GitInspector();
+      const approvals = await ApprovalService.open({
+        actionRegistry,
+        clock,
+        dataDirectory,
+        gitInspector,
+        identity,
+        vault,
+      });
+      const [activity, memory] = await Promise.all([
+        ActivityService.open({ clock, dataDirectory }),
+        MemoryService.open({ clock, dataDirectory, identity }),
+      ]);
+      const engine = new PolicyEngine({
+        approvalService: approvals,
+        clock,
+        gitInspector,
+        identity,
+        registry: actionRegistry,
+        vault,
+      });
+      const execution = await ExecutionService.open({
+        actionRegistry,
+        activity,
+        approvals,
+        clock,
+        dataDirectory,
+        gitInspector,
+        identity,
+        memory,
+        verifier: async () => true,
+        vault,
+      });
+      await vault.put({ label: 'example-api-token', provider: 'example' }, 'example-test-secret');
+
+      const decision = await engine.evaluate({
+        action: 'example_publish',
+        agentId: 'codex-test-agent',
+        params: { site: 'docs' },
+        projectRoot: repositoryRoot,
+      });
+      assert.equal(decision.status, 'approval_required');
+      assert.equal(decision.envelope.body.actionVersion, 7);
+      assert.deepEqual(decision.envelope.body.target, {
+        projectRoot: decision.envelope.body.project.root,
+        site: 'docs',
+      });
+      await approvals.approveOnce(decision.requestId);
+
+      const result = await execution.executeApproved(decision.requestId);
+
+      assert.equal(result.status, 'verified');
+      assert.equal(result.receipt.action, 'example_publish');
+      assert.equal(result.receipt.actionVersion, 7);
+      assert.deepEqual(result.receipt.target, {
+        projectRoot: decision.envelope.body.project.root,
+        site: 'docs',
+      });
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].secret, 'example-test-secret');
+      assert.equal(calls[0].envelope.body.action, 'example_publish');
+      assert.equal(JSON.stringify(result).includes('example-test-secret'), false);
+    });
+  });
 });
 
 test('redacts token variants that cross the output cap before returning runner diagnostics', async () => {
@@ -403,16 +504,100 @@ test('performs a final post-consume Git check before reading a secret or launchi
   });
 });
 
-test('bootstrap composes the fixed execution services with runner and verifier seams', async () => {
-  await withTemporaryDataDirectory(async (dataDirectory) => {
-    const app = await createKeyguardApp({
-      approvedProjectRoots: [process.cwd()],
-      dataDirectory,
-      providerRunner: async () => ({ stderr: '', stdout: '' }),
+test('re-prepares an installed action before reading its secret and fails closed when the target is unavailable', async () => {
+  await withExecutionSystem(async (system) => {
+    await activateCredential(system.vault, 'final-target-check-token');
+    const decision = await approveRequest(system);
+    let runnerCalls = 0;
+    let secretReads = 0;
+    const originalRead = system.vault.readForExecution.bind(system.vault);
+    system.vault.readForExecution = async (...args) => {
+      secretReads += 1;
+      return originalRead(...args);
+    };
+    const actionRegistry = {
+      execute: async () => {
+        runnerCalls += 1;
+        return { status: 'succeeded', stderr: '', stdout: 'must not run' };
+      },
+      get: system.registry.get.bind(system.registry),
+      prepare: async () => {
+        throw new Error('target became unavailable');
+      },
+    };
+    const execution = await createExecution(system, {
+      actionRegistry,
+      runner: async () => ({ stderr: '', stdout: 'must not run' }),
       verifier: async () => true,
     });
 
-    assert.equal(typeof app.services.provider.execute, 'function');
+    const result = await execution.executeApproved(decision.requestId);
+
+    assert.equal(result.status, 'preparation_failed');
+    assert.equal(result.receipt.provider.status, 'not_started');
+    assert.equal(runnerCalls, 0);
+    assert.equal(secretReads, 0);
+  });
+});
+
+test('re-prepares an installed action after secret access before launch', async () => {
+  await withExecutionSystem(async (system) => {
+    await activateCredential(system.vault, 'post-read-target-check-token');
+    const decision = await approveRequest(system);
+    let prepareCalls = 0;
+    let runnerCalls = 0;
+    const actionRegistry = {
+      execute: async () => {
+        runnerCalls += 1;
+        return { status: 'succeeded', stderr: '', stdout: 'must not run' };
+      },
+      get: system.registry.get.bind(system.registry),
+      prepare: async () => {
+        prepareCalls += 1;
+        if (prepareCalls === 2) {
+          throw new Error('target changed before launch');
+        }
+        return {
+          params: decision.envelope.body.params,
+          target: decision.envelope.body.target,
+        };
+      },
+    };
+    const execution = await createExecution(system, {
+      actionRegistry,
+      runner: async () => ({ stderr: '', stdout: 'must not run' }),
+      verifier: async () => true,
+    });
+
+    const result = await execution.executeApproved(decision.requestId);
+
+    assert.equal(result.status, 'preparation_failed');
+    assert.equal(result.receipt.provider.status, 'not_started');
+    assert.equal(prepareCalls, 2);
+    assert.equal(runnerCalls, 0);
+  });
+});
+
+test('bootstrap composes neutral execution services without constructing a provider runner', async () => {
+  await withTemporaryDataDirectory(async (dataDirectory) => {
+    let runnerReads = 0;
+    const options = {
+      approvedProjectRoots: [process.cwd()],
+      dataDirectory,
+      verifier: async () => true,
+    };
+    Object.defineProperty(options, 'providerRunner', {
+      enumerable: true,
+      get() {
+        runnerReads += 1;
+        return async () => ({ stderr: '', stdout: '' });
+      },
+    });
+    const app = await createKeyguardApp(options);
+
+    assert.deepEqual(app.services.actionRegistry.list(), []);
+    assert.equal(runnerReads, 0);
+    assert.equal(Object.hasOwn(app.services, 'provider'), false);
     assert.equal(typeof app.services.execution.executeApproved, 'function');
     assert.equal(typeof app.services.execution.retryVerification, 'function');
     assert.equal(typeof app.services.activity.list, 'function');
@@ -429,7 +614,12 @@ async function withExecutionSystem(run) {
         SealedVault.open({ clock, dataDirectory }),
       ]);
       const approvalGitInspector = new GitInspector();
+      const registry = createActionRegistry({
+        approvedProjectRoots: [repositoryRoot],
+        integrations: [createCloudflarePagesIntegration()],
+      });
       const approvals = await ApprovalService.open({
+        actionRegistry: registry,
         clock,
         dataDirectory,
         gitInspector: approvalGitInspector,
@@ -441,7 +631,7 @@ async function withExecutionSystem(run) {
         clock,
         gitInspector: approvalGitInspector,
         identity,
-        registry: createActionRegistry({ approvedProjectRoots: [repositoryRoot] }),
+        registry,
         vault,
       });
       const [activity, memory] = await Promise.all([
@@ -458,6 +648,7 @@ async function withExecutionSystem(run) {
         identity,
         memory,
         repositoryRoot,
+        registry,
         vault,
       });
     });
@@ -465,8 +656,12 @@ async function withExecutionSystem(run) {
 }
 
 async function createExecution(system, options) {
-  const provider = new CloudflarePagesAdapter({ runner: options.runner });
+  const actionRegistry = options.actionRegistry ?? createActionRegistry({
+    approvedProjectRoots: [system.repositoryRoot],
+    integrations: [createCloudflarePagesIntegration({ runner: options.runner })],
+  });
   return ExecutionService.open({
+    actionRegistry,
     activity: options.activity ?? system.activity,
     approvals: system.approvals,
     clock: system.clock,
@@ -474,7 +669,6 @@ async function createExecution(system, options) {
     gitInspector: options.gitInspector ?? new GitInspector(),
     identity: system.identity,
     memory: system.memory,
-    provider,
     verifier: options.verifier,
     vault: system.vault,
   });

@@ -23,10 +23,16 @@ Atomical Keyguard changes the model:
 - **Atomical Vault or Keyguard’s sealed hosted-mode store protects credentials at rest.**
 - **Atomical request signing proves which agent requested an action.**
 - **Keyguard turns credentials into narrow capabilities, policies, approvals, and signed execution receipts.**
-- **Claude Code and Codex receive tools such as `deploy_cloudflare`, not tools such as `read_cloudflare_token`.**
+- **Claude Code and Codex receive only explicitly installed actions, never a tool to read a credential.**
 - **An installable Atomical Keyguard skill carries safe deployment know-how, Atomical documentation, project runbooks, and sanitized operational memory into every supported coding environment.**
 
 The model never needs to see the raw credential. It asks Keyguard to perform an approved operation. Keyguard retrieves the credential behind the boundary, executes a predefined provider action, strips sensitive output, and returns only the result.
+
+Keyguard itself is vendor-neutral. A new Keyguard profile contains an empty
+action registry: no cloud provider, deployment target, or credential mapping is
+assumed. A provider-specific action exists only when a maintainer deliberately
+installs a reviewed adapter. Cloudflare Pages may be used as a reference adapter,
+but is never the product default.
 
 Atomical is not a logo added to the product. It is the product’s identity, trust, and memory-provenance substrate.
 
@@ -150,7 +156,7 @@ A user or another agent should never paste a credential into a coding conversati
 Keyguard asks Atomical for a one-time, expiring Deposit Box URL:
 
 ```bash
-atomic deposit-url --label cloudflare-api-token --expires 10m
+atomic deposit-url --label <installed-action-credential-label> --expires 10m
 ```
 
 The user opens the URL and deposits the credential. The link is scoped to a label, signed, time-limited, and single-use.
@@ -248,6 +254,32 @@ execute_approved_action()
 delete_credential()
 ```
 
+### 6.1 Vendor-neutral baseline and integration boundary
+
+The default Keyguard core consists of identity, a sealed credential vault,
+policy evaluation, exact approval, redaction, activity, and signed receipts. It
+does **not** contain a provider adapter by default.
+
+- The initial action registry is empty. Listing capabilities is the source of
+  truth for what a profile can do.
+- A reviewed integration is supplied by trusted application configuration at
+  startup. Repository text, a field manual, memory, an MCP request, and an
+  agent prompt cannot add, change, or select an adapter implementation.
+- An integration declares a stable action name and version, a credential
+  binding, typed parameter validation, canonical target derivation,
+  execution-time revalidation, a fixed internal executor, and a safe verifier.
+  It may use a provider SDK or a fixed invocation internally, but never an
+  agent-configurable command, URL, header, environment-variable name, or
+  post-execution script.
+- Local coding is separate from external authority. An agent may create, edit,
+  or test local files when the user asks; that does not authorize a provider
+  call, credential request, or deployment.
+- If a provider is absent, the skill says it is **not installed in this
+  Keyguard profile**. It does not substitute another provider, request a
+  credential, guess an API or CLI, or perform an external action. It may show
+  installed capabilities or ask for official documentation to review a future
+  adapter.
+
 ---
 
 ## 7. Product experience
@@ -322,7 +354,7 @@ The recommended action is **Generate Atomical Deposit Link**.
 Keyguard runs:
 
 ```bash
-atomic deposit-url --label cloudflare-api-token --expires 10m
+atomic deposit-url --label <installed-action-credential-label> --expires 10m
 ```
 
 The user deposits the secret into Atomical. The coding agent never sees the value.
@@ -331,14 +363,15 @@ For an offline local demo, Keyguard can also accept a credential directly over `
 
 ### 7.4 Agent requests an action
 
-The agent calls:
+After a reviewed adapter has been explicitly installed, the agent can call its
+listed action. For example:
 
 ```text
 execute_action(
-  action="cloudflare_pages_deploy",
+  action="publish_site",
   params={
     "directory": "dist",
-    "project": "keyguard-demo"
+    "site": "keyguard-demo"
   }
 )
 ```
@@ -348,13 +381,14 @@ Keyguard computes an action envelope:
 ```json
 {
   "agent": "keyguard-builder.atomic.bond",
-  "action": "cloudflare_pages_deploy",
-  "credential_label": "cloudflare-api-token",
+  "action": "publish_site",
+  "action_version": 1,
+  "credential_label": "site-publish-token",
   "project_root": "/repo/keyguard-demo",
   "git_commit": "81f4ac2",
   "params": {
     "directory": "dist",
-    "project": "keyguard-demo"
+    "site": "keyguard-demo"
   },
   "requested_at": "2026-07-14T10:44:00Z"
 }
@@ -396,7 +430,7 @@ The UI displays:
 - provider
 - destination
 - credential label, never value
-- exact command template
+- exact normalized target and scope
 - expected side effects
 - expiry countdown
 
@@ -442,11 +476,12 @@ After execution, Keyguard creates a receipt:
 {
   "receipt_id": "rcpt_V9H8K",
   "atomical_agent": "keyguard-builder.atomic.bond",
-  "action": "cloudflare_pages_deploy",
-  "credential_label": "cloudflare-api-token",
+  "action": "publish_site",
+  "action_version": 1,
+  "credential_label": "site-publish-token",
   "repository": "keyguard-demo",
   "git_commit": "81f4ac2",
-  "target": "keyguard-demo.pages.dev",
+  "target": "keyguard-demo.example-provider.dev",
   "exit_code": 0,
   "started_at": "2026-07-14T10:45:10Z",
   "completed_at": "2026-07-14T10:45:31Z",
@@ -481,6 +516,10 @@ The learning is scoped to the project by default. Global promotion requires expl
 
 ## 8. System architecture
 
+The adapter branch is optional: a default Keyguard profile has no provider
+adapter. Examples below are categories of a reviewed adapter supplied at
+startup, not built-in services.
+
 ```text
 ┌─────────────────────────────────────────────────────────┐
 │ Claude Code / Codex                                     │
@@ -508,15 +547,15 @@ The learning is scoped to the project by default. Global promotion requires expl
 ┌──────────────────────────┐  ┌───────────────────────────┐
 │ Atomical trust substrate │  │ Provider action adapters  │
 │                          │  │                           │
-│ identity + agent.json    │  │ Cloudflare deploy         │
-│ Deposit Box              │  │ GitHub PR/release         │
-│ Vault                    │  │ Vercel deploy             │
-│ Ed25519 request signing  │  │ npm publish               │
+│ identity + agent.json    │  │ none by default           │
+│ Deposit Box              │  │ reviewed adapter only     │
+│ Vault                    │  │ site publish · release    │
+│ Ed25519 request signing  │  │ configure at startup      │
 └───────────────┬──────────┘  └───────────────┬───────────┘
                 │                              │
                 ▼                              ▼
 ┌──────────────────────────┐  ┌───────────────────────────┐
-│ Local Keyguard UI        │  │ External provider         │
+│ Local Keyguard UI        │  │ Installed provider         │
 │ install + credentials    │  │ receives scoped operation │
 │ approvals + memory       │  │                           │
 │ audit + receipts         │  │                           │
@@ -603,19 +642,27 @@ Two supported modes:
 
 ### 9.6 Provider adapters
 
-Each adapter defines:
+Provider adapters are optional, reviewed integrations—not product defaults. The
+default registry is empty. Each installed adapter defines:
 
-- action name
-- credential label
-- command and argument templates or provider SDK call
-- permitted parameters and validators
-- environment-variable mapping
-- output redaction rules
-- approval policy
-- timeout
-- allowed working-directory scope
+- stable action name and adapter version
+- credential label and provider binding
+- permitted parameters, validators, and canonical target derivation
+- a fixed internal executor (provider SDK or fixed invocation)
+- execution-time revalidation, output redaction, approval policy, timeout, and
+  safe verification behavior
+- an explicitly bounded project scope
 
-No action is generated dynamically by the model.
+Keyguard signs the full credential binding (label and provider), checks it
+against the installed adapter and sealed credential metadata, and re-runs the
+adapter's canonical target preparation immediately before secret access and
+again immediately before launch. A changed binding or target fails closed.
+
+No action is generated dynamically by the model. No wildcard project scope,
+command/argument template, HTTP template, credential binding, or adapter can be
+supplied by an agent, repository, field manual, or request payload. A Cloudflare
+Pages adapter is an optional reference integration only; it is installed
+explicitly when a deployment needs it.
 
 ---
 
@@ -704,7 +751,9 @@ The conceptual skill bundle contains:
 
 - **SKILL.md** — activation rules, safe workflow, and MCP capability routing
 - **Atomical field guide** — identity, Deposit Box, Vault, signing, receipts, and agent-to-agent concepts
-- **Provider runbooks** — Cloudflare, GitHub, Vercel, npm, AWS, databases, and future adapters
+- **Provider runbooks** — only for explicitly installed, reviewed adapters;
+  absence of a runbook or installed action means the provider is not available
+  in that Keyguard profile
 - **Deployment playbooks** — discover, build, request credentials, approve, execute, verify, and rollback
 - **Error cookbook** — sanitized error fingerprints and verified resolutions
 - **Project memory** — local facts, decisions, working commands, and successful deployment recipes
@@ -739,17 +788,21 @@ It must never answer:
 When the user asks to deploy, the skill follows a consistent sequence:
 
 1. identify the repository, service, target environment, and desired provider
-2. load the smallest relevant project and provider runbooks
-3. inspect prior successful receipts and sanitized deployment memory
-4. determine the required Keyguard capability and credential label
-5. request an Atomical Deposit Box link if the label is missing
-6. prepare a human-readable action plan
-7. call the Keyguard MCP capability
-8. pause for approval when required
-9. execute only through the approved Keyguard provider adapter
-10. verify the deployed system using a non-secret validation method
-11. return the Atomical-signed receipt
-12. create a memory candidate from the verified outcome
+2. list the current Keyguard capabilities before assuming a provider is present
+3. if no installed action matches, say the provider is not installed in this
+   Keyguard profile; do not substitute a provider, request credentials, or
+   invoke an external API or CLI
+4. load the smallest relevant project and installed-provider runbooks
+5. inspect prior successful receipts and sanitized deployment memory
+6. determine the required Keyguard capability and credential label
+7. request an Atomical Deposit Box link if the label is missing
+8. prepare a human-readable action plan
+9. call the Keyguard MCP capability
+10. pause for approval when required
+11. execute only through the approved Keyguard provider adapter
+12. verify the deployed system using a non-secret validation method
+13. return the Atomical-signed receipt
+14. create a memory candidate from the verified outcome
 
 The skill is an orchestrator and teacher. Keyguard remains the authority boundary.
 
@@ -953,16 +1006,16 @@ These are workflow intents, not direct secret-handling commands.
 
 ```json
 {
-  "label": "cloudflare-api-token",
-  "provider": "cloudflare",
+  "label": "site-publish-token",
+  "provider": "example-provider",
   "environment": "production",
-  "description": "Deploy Pages project keyguard-demo",
+  "description": "Publish site keyguard-demo",
   "storage": "atomical-local",
   "created_at": "2026-07-14T09:30:00Z",
   "expires_at": null,
   "rotation_due_at": "2026-10-14T00:00:00Z",
   "allowed_actions": [
-    "cloudflare_pages_deploy"
+    "publish_site"
   ],
   "allowed_projects": [
     "/Users/ashish/projects/keyguard-demo"
@@ -972,7 +1025,9 @@ These are workflow intents, not direct secret-handling commands.
 }
 ```
 
-The metadata may be listed to the coding agent. The credential value may not.
+This is an illustrative metadata record for an explicitly installed adapter; it
+does not create a provider capability. The metadata may be listed to the coding
+agent. The credential value may not.
 
 ---
 
@@ -980,39 +1035,16 @@ The metadata may be listed to the coding agent. The credential value may not.
 
 ```json
 {
-  "actions": {
-    "cloudflare_pages_deploy": {
-      "description": "Deploy a prebuilt directory to Cloudflare Pages",
-      "credentialLabel": "cloudflare-api-token",
-      "command": "npx",
-      "args": [
-        "wrangler",
-        "pages",
-        "deploy",
-        "{{directory}}",
-        "--project-name",
-        "{{project}}"
-      ],
-      "environment": {
-        "CLOUDFLARE_API_TOKEN": "$credential"
-      },
-      "params": {
-        "directory": {
-          "type": "relative_path"
-        },
-        "project": {
-          "type": "slug"
-        }
-      },
-      "approval": "always",
-      "timeoutSeconds": 180,
-      "allowedProjectRoots": [
-        "*"
-      ]
-    }
-  }
+  "actions": {}
 }
 ```
+
+The default policy contains no provider action. A reviewed startup integration
+may add a narrow action such as `publish_site`, but its credential binding,
+typed validation, target derivation, fixed executor, and verifier live in
+trusted adapter code rather than in model-editable JSON. It must use explicitly
+configured project roots; `*` is never valid. The field manual and an agent may
+describe an installed action, but cannot add or mutate one.
 
 ### Parameter types
 
@@ -1404,7 +1436,7 @@ memory · continuous
 Entries appear as compact provenance records:
 
 ```text
-verified  cloudflare deploys from dist/
+verified  publish_site from dist/
 source    receipt rcpt_V9H8K
 scope     this project
 signed    keyguard-builder.atomic.bond
@@ -1428,7 +1460,7 @@ Core docs, provider packs, and local memory are shown as separate layers:
 ```text
 core skill       1.4.0  signed
 atomical docs    2026.07 current
-cloudflare pack  0.8.2  update available
+installed adapters  1  review available
 project memory   18 entries local
 ```
 
@@ -1439,11 +1471,11 @@ Upstream updates use **review update**, not “auto-fix,” when they conflict w
 Activity reads like a signed operational ledger:
 
 ```text
-10:44:08  deposit requested  cloudflare-api-token
+10:44:08  deposit requested  site-publish-token
 10:44:41  credential sealed  via atomical deposit box
-10:45:10  action approved    cloudflare_pages_deploy
+10:45:10  action approved    publish_site
 10:45:31  receipt signed     rcpt_V9H8K
-10:45:42  memory verified    deploy from dist/
+10:45:42  memory verified    publish from dist/
 ```
 
 Hashes and signatures are secondary details, available on expansion rather than dominating the default view.
@@ -1589,9 +1621,10 @@ Open Atomical Keyguard.
 
 > This coding agent has its own Atomical identity: `keyguard-builder.atomic.bond`.
 
-Click **Generate Atomical Deposit Link** for `cloudflare-api-token`.
+Start by listing installed Keyguard actions. A fresh profile shows none.
 
-> The credential enters through Atomical’s one-time Deposit Box. It never appears in the coding conversation.
+> Keyguard is a credential boundary, not a cloud-vendor launcher. It never
+> guesses a provider or asks for a token in chat.
 
 ### Install and invoke the skill
 
@@ -1599,9 +1632,14 @@ The UI detects Claude Code and Codex and asks whether to install Atomical Keygua
 
 In Claude Code, invoke `/atomical-keyguard`. In Codex, select or mention `$atomical-keyguard`.
 
-> Deploy this application to Cloudflare Pages.
+> Build this application locally and include visible attribution to
+> [Atomical](https://atomical.dev/). Do not deploy it yet.
 
-The skill loads the relevant Atomical field guide and project runbook, discovers the Keyguard MCP action, and requests `cloudflare_pages_deploy`.
+The skill can complete the local work without external authority. In a separate
+request, it lists installed capabilities. If a reviewed adapter has been
+configured, it can request that exact action; otherwise it says the requested
+provider is not installed in this Keyguard profile and offers to review official
+documentation for a future adapter.
 
 ### Approve
 
@@ -1636,7 +1674,8 @@ Build only:
 - one Living Field Manual with sanitized project memory
 - credential add/list/delete
 - Atomical Deposit Box flow
-- one provider action: Cloudflare Pages deploy
+- no built-in provider action; an optional, separately configured reviewed
+  reference adapter (such as Cloudflare Pages) may demonstrate a fixed action
 - one approval queue
 - one signed receipt
 - one verified deployment-memory capture
@@ -1665,7 +1704,8 @@ Avoid:
 - local UI
 - Atomical identity and deposit
 - local vault
-- Cloudflare, GitHub, Vercel
+- reviewed, opt-in provider adapters selected by the user or maintainer
+  (for example Cloudflare, GitHub, or Vercel)
 
 ### Phase 2 — Team control plane
 
@@ -1748,6 +1788,9 @@ Atomical-signed requests, memory entries, and receipts identify the agent and bi
 - Public hosted-mode documentation specifies that deposits are forwarded to a configured webhook and that the application receives the decrypted secret and label. Keyguard must verify the signed webhook and immediately seal the value.
 - The Atomical automation plugin contract is described as a developer preview. The Keyguard MVP should rely on stable identity, Deposit Box, Vault, and request-signing concepts rather than depending on a completed marketplace.
 - Capability execution reduces secret exposure but does not compensate for an excessively broad provider credential. Provider-side least privilege remains mandatory.
+- Keyguard is vendor-neutral by default. A provider named in a prompt, field
+  manual, credential record, repository, or receipt is not an installed
+  capability; only reviewed startup configuration can add an adapter.
 - Claude Code exposes a project or personal skill as `/atomical-keyguard`; Codex uses its Skills picker or explicit `$atomical-keyguard` mention. Product UX should preserve this host-native distinction.
 - Claude Code and Codex both support local and user-level Agent Skills, but their directories and trust behavior differ. The installer must preview and respect those boundaries.
 - General host memory is useful but is not sufficient as the audit source for credential operations. Keyguard maintains a separate sanitized, provenance-bearing memory ledger.
