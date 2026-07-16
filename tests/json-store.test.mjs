@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, readFile, stat, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 
@@ -45,9 +45,26 @@ test('initialize returns a defensive copy of the initial value', async () => {
     const initial = { nested: { count: 0 } };
 
     const value = await store.initialize(initial);
+    assert.notStrictEqual(value, initial);
+    assert.notStrictEqual(value.nested, initial.nested);
+
     value.nested.count = 5;
+    initial.nested.count = 9;
 
     assert.deepEqual(await store.read(), { nested: { count: 0 } });
+  });
+});
+
+test('initialize rejects a non-serializable value and writes no file', async () => {
+  await withTemporaryDataDirectory(async (directory) => {
+    const store = new JsonStore(join(directory, 'store.json'));
+
+    await assert.rejects(
+      () => store.initialize({ bad: 1n }),
+      /Stored data is unavailable\./,
+    );
+
+    await assert.rejects(() => access(store.path), /ENOENT/);
   });
 });
 
@@ -164,7 +181,10 @@ test('reports unavailable when the stored file contains invalid JSON', async () 
 
 test('reports unavailable when the target path is a directory', async () => {
   await withTemporaryDataDirectory(async (directory) => {
-    const store = new JsonStore(directory);
+    const targetPath = join(directory, 'store.json');
+    await mkdir(targetPath, { mode: 0o700 });
+    const store = new JsonStore(targetPath);
+
     await assert.rejects(() => store.read(), /Stored data is unavailable\./);
   });
 });

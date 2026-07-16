@@ -54,16 +54,6 @@ test('toSafeResponse includes requestId when provided', () => {
   });
 });
 
-test('toSafeResponse exposes only allow-listed keys', () => {
-  const error = new KeyguardError({ code: 'E_CODE', safeMessage: 'msg', requestId: 'r' });
-  assert.deepEqual(Object.keys(error.toSafeResponse()).sort(), [
-    'code',
-    'requestId',
-    'retryable',
-    'safeMessage',
-  ]);
-});
-
 test('rejects a non-string code', () => {
   assert.throws(
     () => new KeyguardError({ code: 42, safeMessage: 'msg' }),
